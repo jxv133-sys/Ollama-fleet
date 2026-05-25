@@ -6,10 +6,11 @@ import argparse
 import asyncio
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
-from ollama_fleet.config import FleetSettings
+from ollama_fleet.config import FleetSettings, load_settings
 from ollama_fleet.db.database import Database
 from ollama_fleet.orchestrator.orchestrator import Orchestrator
 from ollama_fleet.ui.event_bus import UIEventBus
@@ -45,6 +46,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable debug-level logging.",
     )
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Launch the textual UI alongside the orchestrator.",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run a local demo using the bundled DummyExecutor (no Ollama server).",
+    )
     return parser.parse_args()
 
 
@@ -52,7 +63,7 @@ async def run(args: argparse.Namespace) -> int:
     if args.config is not None:
         settings = FleetSettings.from_toml(args.config, _from_env=True)
     else:
-        settings = FleetSettings.load_settings()
+        settings = load_settings()
 
     if args.workspace_base is not None:
         settings = settings.model_copy(update={"workspace": {"base_path": args.workspace_base}})
@@ -61,7 +72,28 @@ async def run(args: argparse.Namespace) -> int:
     await db.connect()
 
     ui_bus = UIEventBus()
+
+    # Optionally start the Textual UI in a daemon thread so the async loop can run the orchestrator.
+    if args.ui:
+        try:
+            from ollama_fleet.ui.dashboard import OllamaFleetDashboard
+
+            dashboard = OllamaFleetDashboard(ui_bus)
+            ui_thread = threading.Thread(target=dashboard.run_blocking, daemon=True)
+            ui_thread.start()
+        except Exception:
+            logging.exception("Failed to start textual UI; continuing without GUI")
+
     orchestrator = Orchestrator(db, settings, ui_bus=ui_bus)
+
+    # If demo flag set, swap in the DummyExecutor (imported from scripts.demo_run)
+    if args.demo:
+        try:
+            from scripts.demo_run import DummyExecutor
+
+            orchestrator.executor = DummyExecutor(settings)
+        except Exception:
+            logging.exception("Failed to initialize demo executor; continuing with configured executor")
 
     try:
         job_id = await orchestrator.submit_job(

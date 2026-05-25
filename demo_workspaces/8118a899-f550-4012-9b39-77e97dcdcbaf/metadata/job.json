@@ -1,0 +1,8 @@
+{
+  "job_id": "8118a899-f550-4012-9b39-77e97dcdcbaf",
+  "goal": "Create a demo project",
+  "created_at": "2026-05-25T15:42:47.448744+00:00",
+  "config": {
+    "source": "demo"
+  }
+}

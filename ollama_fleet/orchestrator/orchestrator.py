@@ -51,6 +51,7 @@ class Orchestrator:
         self.revision_issues: dict[str, list[dict[str, Any]]] = {}
         self.previous_coder_outputs: dict[str, list[tuple[str, str]]] = {}
         self.ui_bus = ui_bus or UIEventBus()
+        self._stall_task: asyncio.Task | None = None
 
     async def submit_job(self, goal: str, config: dict[str, Any]) -> str:
         job_id = str(uuid.uuid4())
@@ -100,6 +101,14 @@ class Orchestrator:
                 }
             )
             return job_id
+        finally:
+            # start stall detector if not already running (safe no-op if loop not running)
+            if getattr(self, "_stall_task", None) is None or (self._stall_task is not None and self._stall_task.done()):
+                try:
+                    self._stall_task = asyncio.create_task(self._check_stall())
+                except RuntimeError:
+                    # If there's no running event loop yet, skip; it will be created on next submit
+                    self._stall_task = None
 
         tasks = self._create_tasks_from_planner(planner_output, job_id)
         await self.scheduler.enqueue_tasks(tasks)
@@ -269,6 +278,17 @@ class Orchestrator:
             extra_context=extra_context,
         )
 
+        # Publish coder output event for dashboard
+        self._publish_event({
+            "type": "agent_output",
+            "agent_type": AgentType.CODER.value,
+            "output": {
+                "file_count": len(coder_output.file_modifications) if isinstance(coder_output, CoderOutput) else 0,
+                "confidence": coder_output.confidence_score if isinstance(coder_output, CoderOutput) else 0,
+                "summary": coder_output.summary if isinstance(coder_output, CoderOutput) else "",
+            }
+        })
+
         if not isinstance(coder_output, CoderOutput):
             await self.scheduler.transition(task.task_id, "failed")
             self._publish_event(
@@ -312,6 +332,12 @@ class Orchestrator:
         for change in coder_output.file_modifications:
             workspace_manager.write_file(change.file_path, change.content)
             modified_files.append(change.file_path)
+            # Publish file written event
+            self._publish_event({
+                "type": "file_written",
+                "path": change.file_path,
+                "job_id": task.job_id,
+            })
 
         validation_result = self.validation.validate(modified_files, workspace_manager)
         self._publish_event(
@@ -463,3 +489,84 @@ class Orchestrator:
             },
         )
         await self.scheduler.transition(task.task_id, "completed")
+
+    async def _check_stall(self) -> None:
+        """Background coroutine: detect stalled jobs and escalate them.
+
+        Checks the most-recent `updated_at` timestamp for non-terminal tasks
+        grouped by job and marks jobs as `failed` if no progress has been made
+        for longer than `scheduler.stall_timeout` seconds.
+        """
+        while True:
+            try:
+                await asyncio.sleep(60)
+                # Find running tasks across jobs and check per-task progress
+                rows = await self.db.fetchall(
+                    "SELECT task_id, job_id, updated_at, retry_count FROM tasks WHERE state = 'running'"
+                )
+                now_ts = datetime.now(timezone.utc).timestamp()
+                for task_id, job_id, updated_at, retry_count in rows:
+                    if updated_at is None:
+                        continue
+                    try:
+                        updated_ts = datetime.fromisoformat(updated_at).timestamp()
+                    except Exception:
+                        continue
+                    elapsed = now_ts - updated_ts
+                    stall_threshold = float(self.settings.scheduler.stall_timeout)
+                    if elapsed <= stall_threshold:
+                        continue
+
+                    # If the task has already retried too many times, fail and escalate
+                    if int(retry_count or 0) >= int(self.settings.scheduler.retry_limit):
+                        # mark task failed and write escalation
+                        await self.scheduler.transition(task_id, "failed", reason="Stalled and retry limit exceeded")
+                        # derive workspace for metadata and write escalation
+                        job = await self.job_manager.get_job(job_id)
+                        if job is not None:
+                            try:
+                                workspace_manager = WorkspaceManager(job.workspace_path)
+                                esc_mgr = EscalationManager(self.db, workspace_manager)
+                                await esc_mgr.write_escalation(
+                                    task_id=task_id,
+                                    job_id=job_id,
+                                    reason="Stalled task exceeded retry limit",
+                                    retry_count=int(retry_count or 0),
+                                )
+                            except Exception:
+                                # best-effort: continue even if workspace unavailable
+                                pass
+                        await self._publish_event({"type": "task_state_changed", "task_id": task_id, "new_state": "failed"})
+                        await self._publish_event({"type": "agent_log", "message": f"Task {task_id} failed: stalled and retry limit exceeded."})
+                        continue
+
+                    # Otherwise increment retry and requeue the task to pending
+                    try:
+                        new_retry = await self.scheduler.increment_retry(task_id)
+                        await self.scheduler.transition(task_id, "pending", reason="Stalled; requeued for retry")
+                        await self.db.execute_and_commit(
+                            "INSERT INTO escalations (task_id, job_id, reason, retry_count, timestamp, dismissed) VALUES (?, ?, ?, ?, ?, 0)",
+                            [task_id, job_id, "Stalled task requeued for retry", new_retry, datetime.now(timezone.utc).isoformat()],
+                        )
+                        # append execution history if workspace exists
+                        job = await self.job_manager.get_job(job_id)
+                        if job is not None:
+                            try:
+                                workspace_manager = WorkspaceManager(job.workspace_path)
+                                workspace_manager.append_execution_history({
+                                    "event": "stalled_task_requeued",
+                                    "task_id": task_id,
+                                    "elapsed_seconds": elapsed,
+                                    "retry_count": new_retry,
+                                })
+                            except Exception:
+                                pass
+
+                        await self._publish_event({"type": "task_state_changed", "task_id": task_id, "new_state": "pending"})
+                        await self._publish_event({"type": "agent_log", "message": f"Task {task_id} requeued after stall; retry {new_retry}."})
+                    except Exception:
+                        logger.exception("Failed handling stalled task %s", task_id)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error in stall detection loop")
