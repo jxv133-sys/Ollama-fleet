@@ -17,10 +17,14 @@ from ollama_fleet.agents.schemas import AgentType, CoderOutput, CriticOutput, Pl
 from ollama_fleet.ollama.client import OllamaClient
 from ollama_fleet.config import FleetSettings
 from ollama_fleet.db.database import Database
+from ollama_fleet.memory.episodic import EpisodicEntry
+from ollama_fleet.memory.memory_system import MemorySystem
 from ollama_fleet.orchestrator.escalation import EscalationManager
 from ollama_fleet.orchestrator.job_manager import JobManager
+from ollama_fleet.scheduler.dependency_resolver import DependencyResolver
 from ollama_fleet.scheduler.task_scheduler import ScheduledTask, TaskScheduler
 from ollama_fleet.validation.validator import ValidationLayer
+from ollama_fleet.ui.event_bus import UIEventBus
 from ollama_fleet.workspace.manager import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -29,18 +33,29 @@ TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
 
 class Orchestrator:
-    def __init__(self, db: Database, settings: FleetSettings) -> None:
+    def __init__(
+        self,
+        db: Database,
+        settings: FleetSettings,
+        ui_bus: UIEventBus | None = None,
+    ) -> None:
         self.db = db
         self.settings = settings
         self.job_manager = JobManager(db)
         self.scheduler = TaskScheduler(db)
+        self.dependency_resolver = DependencyResolver(db)
         self.executor = AgentExecutor(OllamaClient(settings.ollama.base_url), settings)
         self.validation = ValidationLayer()
+        self.memory_system = MemorySystem(db, settings, self.executor.client)
         self.revision_counts: dict[str, int] = {}
         self.revision_issues: dict[str, list[dict[str, Any]]] = {}
+        self.previous_coder_outputs: dict[str, list[tuple[str, str]]] = {}
+        self.ui_bus = ui_bus or UIEventBus()
 
     async def submit_job(self, goal: str, config: dict[str, Any]) -> str:
         job_id = str(uuid.uuid4())
+        await self._recover_running_tasks()
+
         workspace_manager = WorkspaceManager.create_workspace(
             job_id=job_id,
             goal=goal,
@@ -54,6 +69,16 @@ class Orchestrator:
             workspace_path=str(workspace_manager.root),
             job_id=job_id,
         )
+        self._publish_event(
+            {
+                "type": "job_state_changed",
+                "job_id": job_id,
+                "new_state": "submitted",
+            }
+        )
+        workspace_manager.append_execution_history(
+            {"event": "job_submitted", "job_id": job_id, "goal": goal}
+        )
         escalation_manager = EscalationManager(self.db, workspace_manager)
 
         try:
@@ -66,6 +91,13 @@ class Orchestrator:
                 job_id=job_id,
                 reason=str(exc),
                 retry_count=0,
+            )
+            self._publish_event(
+                {
+                    "type": "job_state_changed",
+                    "job_id": job_id,
+                    "new_state": "failed",
+                }
             )
             return job_id
 
@@ -81,11 +113,20 @@ class Orchestrator:
         escalation_manager: EscalationManager,
     ) -> None:
         while True:
+            await self.scheduler.resolve_dependencies(job_id)
+            await self.scheduler.recover_stalled_tasks(job_id, self.settings.scheduler.stall_timeout)
             ready_tasks = await self.scheduler.get_ready_tasks(job_id)
             if not ready_tasks:
                 active = await self.scheduler.count_active_tasks(job_id)
                 if active == 0:
                     await self.job_manager.update_job_state(job_id, "completed")
+                    self._publish_event(
+                        {
+                            "type": "job_state_changed",
+                            "job_id": job_id,
+                            "new_state": "completed",
+                        }
+                    )
                     break
                 await asyncio.sleep(0.1)
                 continue
@@ -102,6 +143,14 @@ class Orchestrator:
         escalation_manager: EscalationManager,
     ) -> None:
         await self.scheduler.transition(task.task_id, "running")
+        self._publish_event(
+            {
+                "type": "task_state_changed",
+                "task_id": task.task_id,
+                "agent_type": task.agent_type,
+                "new_state": "running",
+            }
+        )
 
         if task.agent_type == AgentType.CODER.value:
             await self._run_coder_task(task, workspace, escalation_manager)
@@ -111,6 +160,34 @@ class Orchestrator:
             await self._run_synthesizer_task(task)
         else:
             await self.scheduler.transition(task.task_id, "completed")
+            self._publish_event(
+                {
+                    "type": "task_state_changed",
+                    "task_id": task.task_id,
+                    "agent_type": task.agent_type,
+                    "new_state": "completed",
+                }
+            )
+
+    async def _recover_running_tasks(self) -> None:
+        rows = await self.db.fetchall(
+            "SELECT task_id FROM tasks WHERE state = 'running'",
+        )
+        for row in rows:
+            task_id = row[0]
+            await self.scheduler.transition(task_id, "pending")
+            self._publish_event(
+                {
+                    "type": "agent_log",
+                    "message": f"Recovered stalled task {task_id} to pending state.",
+                }
+            )
+
+    def _publish_event(self, event: dict[str, Any]) -> None:
+        try:
+            self.ui_bus.publish(event)
+        except Exception:
+            pass
 
     async def _run_planner(self, goal: str) -> PlannerOutput:
         output = await self.executor.execute(
@@ -130,6 +207,7 @@ class Orchestrator:
         now = datetime.now(timezone.utc).isoformat()
         tasks = []
         for task in planner_output.tasks:
+            state = "pending" if not task.dependencies else "blocked"
             tasks.append(
                 {
                     "task_id": task.task_id,
@@ -137,7 +215,7 @@ class Orchestrator:
                     "title": task.title,
                     "description": task.description,
                     "agent_type": task.agent_type,
-                    "state": "pending",
+                    "state": state,
                     "priority": task.priority,
                     "retry_count": 0,
                     "dependencies": task.dependencies,
@@ -154,9 +232,32 @@ class Orchestrator:
         workspace_manager: WorkspaceManager,
         escalation_manager: EscalationManager,
     ) -> None:
-        extra_context: dict[str, Any] = {}
+        active_files = [
+            str(path.relative_to(workspace_manager.root))
+            for path in workspace_manager.root.rglob("*.py")
+            if path.is_file()
+        ]
+        file_contents = {
+            path: (workspace_manager.root / path).read_text(encoding="utf-8")
+            for path in active_files
+            if (workspace_manager.root / path).exists()
+        }
+
+        extra_context = {
+            "active_files": active_files,
+            "episodic_summaries": [],
+        }
         if task.task_id in self.revision_issues:
             extra_context["critic_issues"] = self.revision_issues[task.task_id]
+
+        memory_context = await self.memory_system.assemble_context(
+            task_description=task.description,
+            job_id=task.job_id,
+            active_files=active_files,
+            file_contents=file_contents,
+        )
+        extra_context["active_files"] = memory_context.active_files
+        extra_context["episodic_summaries"] = memory_context.episodic_summaries
 
         coder_output = await self.executor.execute(
             {
@@ -170,16 +271,62 @@ class Orchestrator:
 
         if not isinstance(coder_output, CoderOutput):
             await self.scheduler.transition(task.task_id, "failed")
+            self._publish_event(
+                {
+                    "type": "task_state_changed",
+                    "task_id": task.task_id,
+                    "agent_type": task.agent_type,
+                    "new_state": "failed",
+                }
+            )
             return
 
-        modified_files = []
+        current_modifications = [
+            (change.file_path, change.content) for change in coder_output.file_modifications
+        ]
+        if self.previous_coder_outputs.get(task.task_id) == current_modifications:
+            await escalation_manager.write_escalation(
+                task_id=task.task_id,
+                job_id=task.job_id,
+                reason="Identical coder output detected",
+                retry_count=self.revision_counts.get(task.task_id, 0),
+            )
+            await self.scheduler.transition(task.task_id, "failed")
+            self._publish_event(
+                {
+                    "type": "escalation_added",
+                    "escalation": {
+                        "task_id": task.task_id,
+                        "job_id": task.job_id,
+                        "reason": "Identical coder output detected",
+                        "retry_count": self.revision_counts.get(task.task_id, 0),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                }
+            )
+            return
+
+        self.previous_coder_outputs[task.task_id] = current_modifications
+
+        modified_files: list[str] = []
         for change in coder_output.file_modifications:
             workspace_manager.write_file(change.file_path, change.content)
             modified_files.append(change.file_path)
 
         validation_result = self.validation.validate(modified_files, workspace_manager)
+        self._publish_event(
+            {"type": "validation_result", "validation_result": vars(validation_result)}
+        )
         if not validation_result.syntax_ok:
             await self.scheduler.transition(task.task_id, "pending")
+            self._publish_event(
+                {
+                    "type": "task_state_changed",
+                    "task_id": task.task_id,
+                    "agent_type": task.agent_type,
+                    "new_state": "pending",
+                }
+            )
             return
 
         critic_output = await self.executor.execute(
@@ -196,26 +343,98 @@ class Orchestrator:
                     for path in modified_files
                 },
                 "lint_results": [vars(issue) for issue in validation_result.lint_results],
+                "critic_issues": self.revision_issues.get(task.task_id, []),
             },
         )
 
         if isinstance(critic_output, CriticOutput) and not critic_output.approved:
-            count = self.revision_counts.get(task.task_id, 0) + 1
-            self.revision_counts[task.task_id] = count
-            self.revision_issues[task.task_id] = [vars(issue) for issue in critic_output.issues]
-            if count >= self.settings.scheduler.max_critique_revision_loops:
-                await escalation_manager.write_escalation(
-                    task_id=task.task_id,
-                    job_id=task.job_id,
-                    reason="Critic revision loop exceeded",
-                    retry_count=count,
-                )
-                await self.scheduler.transition(task.task_id, "failed")
-                return
-            await self.scheduler.transition(task.task_id, "pending")
+            await self._handle_critic_output(task, critic_output, escalation_manager)
             return
 
+        if coder_output.confidence_score < 0.4:
+            self._publish_event(
+                {
+                    "type": "agent_log",
+                    "message": f"Low confidence detected for {task.task_id}: {coder_output.confidence_score:.2f}",
+                }
+            )
+
+        await self.memory_system.save_episodic(
+            EpisodicEntry(
+                job_id=task.job_id,
+                task_id=task.task_id,
+                agent_type=task.agent_type,
+                outcome="completed",
+                files_modified=modified_files,
+                summary_text=coder_output.summary,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
         await self.scheduler.transition(task.task_id, "completed")
+        self._publish_event(
+            {
+                "type": "task_state_changed",
+                "task_id": task.task_id,
+                "agent_type": task.agent_type,
+                "new_state": "completed",
+            }
+        )
+
+    async def _handle_critic_output(
+        self,
+        task: ScheduledTask,
+        critic_output: CriticOutput,
+        escalation_manager: EscalationManager,
+    ) -> None:
+        count = self.revision_counts.get(task.task_id, 0) + 1
+        self.revision_counts[task.task_id] = count
+        self.revision_issues[task.task_id] = [vars(issue) for issue in critic_output.issues]
+        if count >= self.settings.scheduler.max_critique_revision_loops:
+            await escalation_manager.write_escalation(
+                task_id=task.task_id,
+                job_id=task.job_id,
+                reason="Critic revision loop exceeded",
+                retry_count=count,
+            )
+            await self.scheduler.transition(task.task_id, "failed")
+            self._publish_event(
+                {
+                    "type": "task_state_changed",
+                    "task_id": task.task_id,
+                    "agent_type": task.agent_type,
+                    "new_state": "failed",
+                }
+            )
+            self._publish_event(
+                {
+                    "type": "escalation_added",
+                    "escalation": {
+                        "task_id": task.task_id,
+                        "job_id": task.job_id,
+                        "reason": "Critic revision loop exceeded",
+                        "retry_count": count,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                }
+            )
+            return
+
+        await self.scheduler.transition(task.task_id, "pending")
+        self._publish_event(
+            {
+                "type": "task_state_changed",
+                "task_id": task.task_id,
+                "agent_type": task.agent_type,
+                "new_state": "pending",
+            }
+        )
+        self._publish_event(
+            {
+                "type": "agent_log",
+                "message": f"Task {task.task_id} requires revision loop {count}",
+            }
+        )
 
     async def _run_tester_task(self, task: ScheduledTask) -> None:
         await self.executor.execute(

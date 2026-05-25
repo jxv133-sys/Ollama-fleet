@@ -56,7 +56,7 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Use `st.sampled_from(['pending','running','completed','failed','blocked','cancelled'])`
     - Write task to SQLite, read back, assert state is identical
 
-- [ ] 4. Implement the Ollama client
+- [x] 4. Implement the Ollama client
   - [x] 4.1 Implement `ollama_fleet/ollama/client.py` with async httpx streaming
     - Define `OllamaConnectionError`, `OllamaHTTPError` (with `status_code` and `body`), `OllamaTimeoutError`
     - Implement `OllamaClient.generate(model, prompt, timeout)` using `httpx.AsyncClient.stream()`
@@ -74,7 +74,7 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Use `st.integers(min_value=400, max_value=599)` for status codes
     - Assert `OllamaHTTPError` raised with correct `status_code`; assert `OllamaConnectionError` for connection failures
 
-- [ ] 5. Implement Pydantic agent output schemas
+- [x] 5. Implement Pydantic agent output schemas
   - [x] 5.1 Implement `ollama_fleet/agents/schemas.py` with all five agent output schemas
     - Define `PlannerTask`, `PlannerOutput` (tasks, milestones, architecture_notes)
     - Define `FileModification`, `CoderOutput` (file_modifications, summary, confidence_score in [0.0, 1.0])
@@ -89,8 +89,8 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Use `st.builds()` for each of the five schema types
     - Assert `model_validate_json(model_dump_json(instance)) == instance` for all five types
 
-- [ ] 6. Implement the Workspace Manager
-  - [ ] 6.1 Implement `ollama_fleet/workspace/manager.py` with directory creation and atomic writes
+- [x] 6. Implement the Workspace Manager
+  - [x] 6.1 Implement `ollama_fleet/workspace/manager.py` with directory creation and atomic writes
     - Implement `WorkspaceManager.create_workspace(job_id)`: create `src/`, `tests/`, `logs/`, `agent_outputs/`, `validation/`, `summaries/`, `metadata/` subdirectories
     - Write `metadata/job.json` at creation time with job_id, goal, created_at, config
     - Implement `write_file(rel_path, content)` using write-to-temp-then-rename atomic pattern
@@ -110,24 +110,24 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Use `st.text()` including `../` sequences
     - Assert any path resolving outside workspace root returns `error_type: "path_traversal"` and no filesystem operation is performed
 
-- [ ] 7. Implement the Tool Runtime
-  - [ ] 7.1 Implement `ollama_fleet/tools/file_tools.py` with `read_file`, `write_file`, `list_files`, `search_code`
+- [x] 7. Implement the Tool Runtime
+  - [x] 7.1 Implement `ollama_fleet/tools/file_tools.py` with `read_file`, `write_file`, `list_files`, `search_code`
     - `read_file`: validate path, return content or structured error (`file_not_found`, `permission_denied`)
     - `write_file`: validate path, delegate to `WorkspaceManager.write_file`
     - `list_files`: validate path, return directory listing
     - `search_code`: validate path, run regex search across workspace files
     - _Requirements: 7.1, 7.2, 7.10_
-  - [ ] 7.2 Implement `ollama_fleet/tools/shell_tools.py` with `run_command` and `run_tests`
+  - [x] 7.2 Implement `ollama_fleet/tools/shell_tools.py` with `run_command` and `run_tests`
     - `run_command`: validate args against `SHELL_METACHARACTERS` set `{; & | > < $ \` ( ) { } [ ] * ? ! ~}`; execute subprocess with configurable timeout; return stdout, stderr, exit_code
     - On timeout: terminate subprocess, return `error_type: "timeout"` with `timeout_seconds`, partial stdout/stderr
     - `run_tests`: execute test suite, return structured result with pass_count, fail_count, per-failure details
     - _Requirements: 7.1, 7.3, 7.4, 7.6, 7.7_
-  - [ ] 7.3 Implement `ollama_fleet/tools/git_tools.py` with `git_diff` and `git_commit`
+  - [x] 7.3 Implement `ollama_fleet/tools/git_tools.py` with `git_diff` and `git_commit`
     - `git_diff`: run `git diff`, return structured output
     - `git_commit`: stage and commit with provided message
     - Return `tool_unavailable` error when git is disabled in config
     - _Requirements: 7.1, 7.8, 7.9_
-  - [ ] 7.4 Implement `ollama_fleet/tools/runtime.py` as the central tool dispatcher
+  - [x] 7.4 Implement `ollama_fleet/tools/runtime.py` as the central tool dispatcher
     - Implement `ToolRuntime.invoke(tool_name, args, task_id)` dispatching to the correct tool function
     - Log every invocation: tool name, arguments, result, duration, task_id
     - _Requirements: 7.5_
@@ -137,11 +137,11 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Use `st.text()` seeded with characters from the metacharacter set
     - Assert `run_command` returns validation error and no subprocess is spawned
 
-- [ ] 8. Implement the Task Scheduler (Phase 1 — basic queue, no dependency resolution)
-  - [ ] 8.1 Implement `ollama_fleet/scheduler/task_scheduler.py` with state machine and atomic transitions
+- [x] 8. Implement the Task Scheduler (Phase 1 — basic queue, no dependency resolution)
+  - [x] 8.1 Implement `ollama_fleet/scheduler/task_scheduler.py` with state machine and atomic transitions
     - Implement `TaskScheduler.enqueue_tasks(tasks)`: insert task records with `pending` state
     - Implement `get_ready_tasks(job_id)`: return tasks in `pending` state
-    - Implement `transition(task_id, new_state, reason)` using `BEGIN IMMEDIATE` + optimistic locking via `version` column: `UPDATE tasks SET state=?, version=version+1 WHERE task_id=? AND state=? AND version=?`; return `False` if 0 rows updated
+    - Implement `transition(task_id, new_state, reason)` using `BEGIN IMMEDIATE` + optimistic locking via `version` column: `UPDATE tasks SET state=?, version=version+1 WHERE task_id=? AND version=?`; return `False` if 0 rows updated
     - Implement `increment_retry(task_id)`: increment `retry_count`, return new value
     - Implement `cancel_task(task_id)`: transition `pending`/`blocked` → `cancelled`
     - _Requirements: 2.1, 2.3, 2.4, 2.5, 2.6, 2.7_
@@ -161,8 +161,8 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Use `st.sampled_from(AgentType)` for all agent types
     - Assert `dispatched_at` is non-null and `agent_type` is correct immediately after dispatch
 
-- [ ] 9. Implement the Agent Executor and Phase 1 agent prompt builders
-  - [ ] 9.1 Implement `ollama_fleet/agents/executor.py` with prompt assembly, retry, timeout, and logging
+- [x] 9. Implement the Agent Executor and Phase 1 agent prompt builders
+  - [x] 9.1 Implement `ollama_fleet/agents/executor.py` with prompt assembly, retry, timeout, and logging
     - Implement `AgentExecutor.execute(task, agent_type, extra_context)` following the 8-step execution flow
     - Assemble system + user messages; call `OllamaClient.generate()` with configured timeout
     - On `PydanticValidationError`: build error-correction prompt including validation error details, retry up to `retry_limit` (1–5); log raw response and error before each retry
@@ -179,22 +179,22 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - **Validates: Requirements 3.8**
     - Use `st.lists(st.sampled_from(['timeout','schema']))` for mixed failure sequences
     - Assert schema-validation retry counter is incremented only by schema failures, not by timeouts
-  - [ ] 9.4 Implement `ollama_fleet/agents/planner.py` — Planner_Agent prompt builder
+  - [x] 9.4 Implement `ollama_fleet/agents/planner.py` — Planner_Agent prompt builder
     - Build system prompt defining the Planner role and output schema
     - Build user prompt injecting the job goal and `architecture_notes` context
     - Return assembled messages dict for `AgentExecutor`
     - _Requirements: 1.3, 3.4, 5.1_
-  - [ ] 9.5 Implement `ollama_fleet/agents/coder.py` — Coding_Agent prompt builder
+  - [x] 9.5 Implement `ollama_fleet/agents/coder.py` — Coding_Agent prompt builder
     - Build system prompt defining the Coder role and `CoderOutput` schema
     - Build user prompt injecting task description, active context files, and episodic summaries
     - _Requirements: 3.4, 5.2_
-  - [ ] 9.6 Implement `ollama_fleet/agents/tester.py` — Tester_Agent prompt builder
+  - [x] 9.6 Implement `ollama_fleet/agents/tester.py` — Tester_Agent prompt builder
     - Build system prompt defining the Tester role and `TesterOutput` schema
     - Build user prompt injecting workspace state and test results
     - _Requirements: 3.4, 5.4_
 
 - [ ] 10. Implement the Phase 1 Orchestrator and job lifecycle
-  - [ ] 10.1 Implement `ollama_fleet/orchestrator/job_manager.py` with job CRUD and state transitions
+  - [x] 10.1 Implement `ollama_fleet/orchestrator/job_manager.py` with job CRUD and state transitions
     - Implement `JobManager.create_job(goal, config)`: generate unique job_id (UUID4), persist to `jobs` table, return job_id
     - Implement `get_job(job_id)`, `update_job_state(job_id, new_state)`, `list_jobs_by_state(state)`
     - _Requirements: 1.1, 1.2_
@@ -203,7 +203,7 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - **Validates: Requirements 1.2**
     - Use `st.lists(st.text(), min_size=2)` for goal strings
     - Submit N jobs; assert all returned job_ids are distinct
-  - [ ] 10.3 Implement `ollama_fleet/orchestrator/orchestrator.py` — Phase 1 dispatch loop
+  - [x] 10.3 Implement `ollama_fleet/orchestrator/orchestrator.py` — Phase 1 dispatch loop
     - Implement `submit_job(goal, config)`: create workspace, persist job, invoke Planner_Agent, enqueue tasks, start dispatch loop
     - Implement `dispatch_loop(job_id)`: poll `get_ready_tasks` at ≤5s intervals; dispatch each ready task via `AgentExecutor`; check terminal condition
     - Implement `cancel_job(job_id)`, `pause_job(job_id)`, `resume_job(job_id)`
@@ -246,8 +246,8 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
 
 ## Phase 2: Critique Loop + Validation + Synthesizer
 
-- [ ] 13. Implement the Validation Layer
-  - [ ] 13.1 Implement `ollama_fleet/validation/validator.py` with syntax checking and linting
+- [x] 13. Implement the Validation Layer
+  - [x] 13.1 Implement `ollama_fleet/validation/validator.py` with syntax checking and linting
     - Implement `ValidationLayer.validate(modified_files, workspace)` running the 5-step pipeline
     - Syntax check: `ast.parse()` for Python files; record `SyntaxValidationError` per file
     - Lint: invoke `ruff` subprocess on modified files; parse output into `LintIssue` list; if `ruff` binary not found, record `linter_unavailable` warning and proceed
@@ -261,16 +261,16 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Use `st.text()` to generate syntactically invalid Python
     - Assert `retry_count` is identical before and after the validation failure re-queue
 
-- [ ] 14. Implement Critic and Synthesizer agents
-  - [ ] 14.1 Implement `ollama_fleet/agents/critic.py` — Critic_Agent prompt builder
+- [x] 14. Implement Critic and Synthesizer agents
+  - [x] 14.1 Implement `ollama_fleet/agents/critic.py` — Critic_Agent prompt builder
     - Build system prompt defining the Critic role and `CriticOutput` schema
     - Build user prompt injecting exact file paths and contents of all files modified by the preceding Coding_Agent (within Active_Context token limit), plus lint results from Validation_Layer
     - _Requirements: 3.4, 5.3, 6.6_
-  - [ ] 14.2 Implement `ollama_fleet/agents/synthesizer.py` — Synthesizer_Agent prompt builder
+  - [x] 14.2 Implement `ollama_fleet/agents/synthesizer.py` — Synthesizer_Agent prompt builder
     - Build system prompt defining the Synthesizer role and `SynthesizerOutput` schema
     - Build user prompt injecting job goal, completed task summaries, and files produced
     - _Requirements: 1.6, 3.4, 5.5_
-  - [ ] 14.3 Extend `ollama_fleet/agents/schemas.py` with `CriticOutput` and `SynthesizerOutput`
+  - [x] 14.3 Extend `ollama_fleet/agents/schemas.py` with `CriticOutput` and `SynthesizerOutput`
     - Add `CriticIssue`, `CriticOutput`, `SynthesizerOutput` to schemas
     - Update `AgentOutput` union type
     - _Requirements: 5.3, 5.5_
@@ -299,7 +299,7 @@ All implementation is in Python using `asyncio`, `httpx`, `pydantic v2`, `textua
     - Escalation record fields: `task_id`, `job_id`, `reason`, `retry_count`, `timestamp` (ISO 8601)
     - Implement identical-output loop detection: compare current `CoderOutput.file_modifications` byte-for-byte with previous invocation; if identical, mark task `failed` without re-queuing
     - _Requirements: 13.1, 13.2_
-  - [ ] 16.2 Write property test for escalation record field completeness
+  - [x] 16.2 Write property test for escalation record field completeness
     - **Property 25: Escalation Record Field Completeness**
     - **Validates: Requirements 13.2**
     - Use `st.builds(Task, ...)` for escalated tasks
