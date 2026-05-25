@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 class OllamaConfig(BaseModel):
     """Settings for the Ollama server and model assignments."""
 
-    base_url: str = "http://192.168.50.142:7869/v1"
+    base_url: str = "http://192.168.50.142:7869"
     planner_model: str = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
     coder_model: str = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
     summarizer_model: str = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"

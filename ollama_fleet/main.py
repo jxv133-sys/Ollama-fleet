@@ -73,17 +73,6 @@ async def run(args: argparse.Namespace) -> int:
 
     ui_bus = UIEventBus()
 
-    # Optionally start the Textual UI in a daemon thread so the async loop can run the orchestrator.
-    if args.ui:
-        try:
-            from ollama_fleet.ui.dashboard import OllamaFleetDashboard
-
-            dashboard = OllamaFleetDashboard(ui_bus)
-            ui_thread = threading.Thread(target=dashboard.run_blocking, daemon=True)
-            ui_thread.start()
-        except Exception:
-            logging.exception("Failed to start textual UI; continuing without GUI")
-
     orchestrator = Orchestrator(db, settings, ui_bus=ui_bus)
 
     # If demo flag set, swap in the DummyExecutor (imported from scripts.demo_run)
@@ -96,6 +85,21 @@ async def run(args: argparse.Namespace) -> int:
             logging.exception("Failed to initialize demo executor; continuing with configured executor")
 
     try:
+        if args.ui:
+            try:
+                from ollama_fleet.ui.dashboard import OllamaFleetDashboard
+
+                dashboard = OllamaFleetDashboard(
+                    ui_bus,
+                    orchestrator=orchestrator,
+                    goal=args.goal,
+                    config={"source": "cli", "workspace_base": args.workspace_base},
+                )
+                dashboard.run_blocking()
+                return 0
+            except Exception:
+                logging.exception("Failed to start textual UI; continuing without GUI")
+
         job_id = await orchestrator.submit_job(
             goal=args.goal,
             config={"source": "cli", "workspace_base": args.workspace_base},
@@ -117,4 +121,35 @@ def main() -> int:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # If the user asked to launch the GUI, run the dashboard in the main thread
+    # (Textual's driver needs to run outside an already-running asyncio loop).
+    if args.ui:
+        settings = load_settings()
+        if args.workspace_base is not None:
+            settings = settings.model_copy(update={"workspace": {"base_path": args.workspace_base}})
+        db = Database(Path(args.db_path))
+        # Connect synchronously
+        asyncio.run(db.connect())
+        ui_bus = UIEventBus()
+        orchestrator = Orchestrator(db, settings, ui_bus=ui_bus)
+        if args.demo:
+            try:
+                from scripts.demo_run import DummyExecutor
+
+                orchestrator.executor = DummyExecutor(settings)
+            except Exception:
+                logging.exception("Failed to initialize demo executor; continuing with configured executor")
+
+        try:
+            from ollama_fleet.ui.dashboard import OllamaFleetDashboard
+
+            dashboard = OllamaFleetDashboard(ui_bus, orchestrator=orchestrator, goal=args.goal, config={"source": "gui"})
+            dashboard.run()
+        finally:
+            asyncio.run(db.close())
+        return 0
     return asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

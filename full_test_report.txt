@@ -1,0 +1,152 @@
+================================================================================
+OLLAMA FLEET - FULL TEST REPORT
+================================================================================
+
+Generated: 2026-05-25T15:56:19.803817
+Job ID: f62ffe04-36c1-4b1a-9421-92b5a3888b4e
+Goal: Create a comprehensive Python project with utilities module
+Status: completed
+Total Events: 11
+
+================================================================================
+AGENT RESPONSES
+================================================================================
+
+### PLANNER Agent ###
+Response 1:
+  Timestamp: 2026-05-25T15:56:19.187427
+  Output: {
+    "tasks_created": 1,
+    "milestones": [
+        "demo-ready"
+    ],
+    "architecture": "demo arch"
+}
+
+### CODER Agent ###
+Response 1:
+  Timestamp: 2026-05-25T15:56:19.693111
+  Output: {
+    "file_count": 1,
+    "confidence": 0.95,
+    "summary": "Added demo.greet"
+}
+
+### CRITIC Agent ###
+Response 1:
+  Timestamp: 2026-05-25T15:56:19.698012
+  Output: {
+    "approved": true,
+    "issues_found": 0,
+    "assessment": "Looks good"
+}
+
+### TESTER Agent ###
+No responses
+
+### SYNTHESIZER Agent ###
+No responses
+
+================================================================================
+EVENT TIMELINE
+================================================================================
+
+1. workspace_created
+
+2. job_state_changed
+
+3. agent_output
+   Agent: planner
+   Output: {'tasks_created': 1, 'milestones': ['demo-ready'], 'architecture': 'demo arch'}
+
+4. agent_log
+   Message: [PLANNER] Created 1 tasks ready for execution
+
+5. task_state_changed
+   Task: demo-task-63e5a1fc
+   Agent: coder
+   State: running
+
+6. agent_output
+   Agent: coder
+   Output: {'file_count': 1, 'confidence': 0.95, 'summary': 'Added demo.greet'}
+
+7. file_written
+   File: src/demo.py
+
+8. validation_result
+
+9. agent_output
+   Agent: critic
+   Output: {'approved': True, 'issues_found': 0, 'assessment': 'Looks good'}
+
+10. task_state_changed
+   Task: demo-task-63e5a1fc
+   Agent: coder
+   State: completed
+
+11. job_state_changed
+
+================================================================================
+PROJECT VERIFICATION
+================================================================================
+
+Workspace Path: /Users/jonahvaira/Documents/GitHub/Ollama-fleet/Ollama-fleet-/workspaces/f62ffe04-36c1-4b1a-9421-92b5a3888b4e
+Workspace Exists: True
+Total Size: 615 bytes
+
+Files Created (4):
+  - logs/execution_history.jsonl
+  - metadata/job.json
+  - src/demo.py
+  - validation/validation_2026-05-25T19:56:19.694039+00:00.json
+
+Directories Created (7):
+  - agent_outputs
+  - logs
+  - metadata
+  - src
+  - summaries
+  - tests
+  - validation
+
+File Contents Preview:
+
+--- logs/execution_history.jsonl ---
+{"event": "job_submitted", "job_id": "f62ffe04-36c1-4b1a-9421-92b5a3888b4e", "goal": "Create a comprehensive Python project with utilities module", "timestamp": "2026-05-25T19:56:19.184285+00:00"}
+
+
+--- metadata/job.json ---
+{
+  "job_id": "f62ffe04-36c1-4b1a-9421-92b5a3888b4e",
+  "goal": "Create a comprehensive Python project with utilities module",
+  "created_at": "2026-05-25T19:56:18.881672+00:00",
+  "config": {
+    "source": "full_test"
+  }
+}
+
+--- src/demo.py ---
+def greet(name):
+    return f"Hello, {name}!"
+
+
+--- validation/validation_2026-05-25T19:56:19.694039+00:00.json ---
+{
+  "syntax_ok": true,
+  "linter_available": false,
+  "timestamp": "2026-05-25T19:56:19.694039+00:00",
+  "lint_results": [],
+  "syntax_errors": []
+}
+
+================================================================================
+SUMMARY
+================================================================================
+
+Agents with responses: 3/5
+Files created: 4
+Directories created: 7
+Total events: 11
+
+✓ TEST PASSED - Project created successfully

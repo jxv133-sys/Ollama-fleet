@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Footer, Header, Static, TextLog, Tree
+from textual.containers import Container
+from textual.widgets import Footer, Header, Log, Static, Input, Button
+from textual.reactive import reactive
 
 from ollama_fleet.ui.event_bus import UIEventBus
 
@@ -23,6 +25,7 @@ class JobInfoPanel(Static):
         
         lines = ["[bold]JOB INFO[/bold]"]
         lines.append(f"ID:      {job_id[:16]}" if job_id else "ID:      -")
+        lines.append(f"State:   {getattr(self, '_state', 'unknown')}")
         lines.append(f"Goal:    {goal[:50]}" if goal else "Goal:    -")
         lines.append(f"Path:    {Path(workspace).name}" if workspace else "Path:    -")
         if start_time:
@@ -84,46 +87,143 @@ class OllamaFleetDashboard(App):
 
     CSS = """
     Screen {
+        layout: vertical;
+    }
+    Header { 
+        dock: top; 
+        height: 1; 
+    }
+    Footer { 
+        dock: bottom; 
+        height: 1; 
+    }
+    #input-container { 
+        height: auto;
+        border: solid white;
+        padding: 1;
+    }
+    #main-grid {
         layout: grid;
         grid-size: 3 3;
-        grid-columns: 1fr 1fr 2fr;
-        grid-rows: auto 1fr 1fr;
+        height: 1fr;
     }
-    Header { dock: top; height: 1; }
-    Footer { dock: bottom; height: 1; }
-    #job-info { row-span: 1; column-span: 1; border: solid $primary; }
-    #agent-status { row-span: 2; column-span: 1; border: solid $accent; }
-    #file-tree { row-span: 2; column-span: 1; border: solid $success; }
-    #progress { row-span: 2; column-span: 1; border: solid $warning; }
-    #raw-output { row-span: 3; column-span: 1; border: solid $info; }
-    TextLog { height: 1fr; }
+    #job-info { 
+        border: solid white;
+    }
+    #agent-status { 
+        row-span: 2;
+        border: solid cyan;
+    }
+    #file-tree { 
+        row-span: 2;
+        border: solid green;
+    }
+    #progress { 
+        row-span: 2;
+        border: solid yellow;
+    }
+    #raw-output { 
+        row-span: 3;
+        border: solid blue;
+    }
+    Log { height: 1fr; }
+    Input { width: 1fr; }
+    Button { margin: 0 1; }
     """
 
-    BINDINGS = [("q", "quit", "Quit")]
+    BINDINGS = [("q", "quit", "Quit"), ("ctrl+c", "quit", "Quit")]
 
-    def __init__(self, ui_bus: UIEventBus):
+    job_running = reactive(False)
+
+    def __init__(self, ui_bus: UIEventBus, orchestrator: Any | None = None, goal: str = "", config: dict[str, Any] | None = None):
         super().__init__()
         self.ui_bus = ui_bus
+        self.orchestrator = orchestrator
+        self.goal = goal
+        self.config = config or {}
         self.title = "Ollama Fleet Dashboard"
         self.job_info = JobInfoPanel(id="job-info")
         self.agent_status = AgentStatusPanel(id="agent-status")
         self.progress = ProgressPanel(id="progress")
         self.file_tree = FileTreePanel(id="file-tree")
-        self.raw_output = TextLog(id="raw-output")
+        self.raw_output = Log(id="raw-output")
+        self.goal_input = Input(placeholder="Enter project goal...", id="goal-input")
+        self.submit_btn = Button("Submit Goal", id="submit-btn")
+        self._input_container = Container(id="input-container")
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield self.job_info
-        yield self.agent_status
-        yield self.file_tree
-        yield self.progress
-        yield self.raw_output
+        with self._input_container:
+            yield self.goal_input
+            yield self.submit_btn
+        with Container(id="main-grid"):
+            yield self.job_info
+            yield self.agent_status
+            yield self.file_tree
+            yield self.progress
+            yield self.raw_output
         yield Footer()
 
-    def on_mount(self) -> None:
-        """Set up event subscription and refresh."""
+    async def on_mount(self) -> None:
+        """Set up event subscription, refresh, and optionally start the orchestrator."""
         self.ui_bus.subscribe(self._handle_event)
         self.set_interval(0.5, self._refresh_panels)
+        
+        # If a goal was provided via command line, pre-populate it
+        if self.goal:
+            self.goal_input.value = self.goal
+            await asyncio.sleep(0.5)  # Give UI time to render
+            # Auto-submit if goal was provided
+            await self._submit_goal()
+        else:
+            self.raw_output.write_line("[cyan]Enter a project goal above and press 'Submit Goal'[/cyan]")
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button press for goal submission."""
+        if event.button.id == "submit-btn":
+            await self._submit_goal()
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Handle Enter key in goal input."""
+        if event.input.id == "goal-input":
+            await self._submit_goal()
+
+    async def _submit_goal(self) -> None:
+        """Submit the goal to the orchestrator."""
+        goal_text = self.goal_input.value.strip()
+        if not goal_text:
+            self.raw_output.write_line("[red]Goal cannot be empty[/red]")
+            return
+        
+        if self.job_running:
+            self.raw_output.write_line("[red]Job already running[/red]")
+            return
+
+        if self.orchestrator is None:
+            self.raw_output.write_line("[red]Orchestrator not available[/red]")
+            return
+
+        self.job_running = True
+        self.goal_input.disabled = True
+        self.submit_btn.disabled = True
+        
+        self.raw_output.write_line(f"[cyan]Submitting goal: {goal_text}[/cyan]")
+        await self._start_job(goal_text)
+
+    async def _start_job(self, goal: str) -> None:
+        """Start a job with the given goal."""
+        if self.orchestrator is None:
+            return
+        try:
+            job_id = await self.orchestrator.submit_job(goal, self.config)
+            self.raw_output.write_line(f"[green]✓ Job completed: {job_id}[/green]")
+        except Exception as exc:
+            self.raw_output.write_line(f"[red]✗ Orchestrator failed: {exc}[/red]")
+        finally:
+            self.job_running = False
+            self.goal_input.disabled = False
+            self.submit_btn.disabled = False
+            self.raw_output.write_line("[cyan]Ready for next goal[/cyan]")
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         """Process events from UIEventBus."""
@@ -132,8 +232,11 @@ class OllamaFleetDashboard(App):
         if t == "job_state_changed":
             jid = event.get("job_id")
             self.job_info._job_id = jid
+            self.job_info._state = event.get("new_state", "unknown")
+            self.job_info._goal = event.get("goal", getattr(self.job_info, "_goal", ""))
             if not hasattr(self.job_info, "_start_time") or not self.job_info._start_time:
                 self.job_info._start_time = datetime.now(timezone.utc).timestamp()
+            self.raw_output.write_line(f"[green]Job {jid} is {self.job_info._state}[/green]")
 
         elif t == "agent_log":
             msg = event.get("message", "")
@@ -152,18 +255,30 @@ class OllamaFleetDashboard(App):
             state = event.get("new_state", "pending")
             if not hasattr(self.progress, "_tasks"):
                 self.progress._tasks = {}
-            self.progress._tasks[tid] = {
-                "state": state,
-                "agent_type": agent,
-                "start_time": datetime.now(timezone.utc).timestamp(),
-                "elapsed": 0,
-            }
+            if not hasattr(self.agent_status, "_agents"):
+                self.agent_status._agents = {}
+
+            task_info = self.progress._tasks.get(tid, {})
+            if state == "running" or not task_info:
+                task_info["start_time"] = datetime.now(timezone.utc).timestamp()
+            task_info["state"] = state
+            task_info["agent_type"] = agent
+            task_info["elapsed"] = task_info.get("elapsed", 0)
+            self.progress._tasks[tid] = task_info
+
+            agent_info = self.agent_status._agents.get(agent, {})
+            if state == "running":
+                agent_info["start_time"] = agent_info.get("start_time", datetime.now(timezone.utc).timestamp())
+            agent_info["state"] = state
+            agent_info["elapsed"] = agent_info.get("elapsed", 0)
+            self.agent_status._agents[agent] = agent_info
 
         elif t == "workspace_created":
             ws = event.get("workspace_path")
             if ws:
                 self.job_info._workspace = str(ws)
                 self._update_file_tree(str(ws))
+                self.raw_output.write_line(f"[blue]Workspace created:[/blue] {ws}")
 
         elif t == "file_written":
             path = event.get("path")

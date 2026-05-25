@@ -64,6 +64,25 @@ class AgentExecutor:
                     raise
                 retries += 1
                 prompt = self._build_retry_prompt(prompt, exc)
+            except ValueError as exc:
+                # Treat parsing/value errors similarly to validation errors so
+                # the executor can retry with a corrected prompt rather than
+                # crashing the orchestrator immediately.
+                duration = time.monotonic() - start
+                logger.warning(
+                    "AgentExecutor.parse_error task_id=%s agent_type=%s duration=%.3f error=%s",
+                    task.get("task_id"),
+                    agent_type.value,
+                    duration,
+                    exc,
+                )
+                if retries >= self.settings.scheduler.retry_limit:
+                    raise
+                retries += 1
+                # Re-use the same retry prompt path as for validation failures.
+                # Pass the actual exception so we can include its message
+                # when asking the model to correct its output.
+                prompt = self._build_retry_prompt(prompt, exc)
             except OllamaTimeoutError:
                 logger.error(
                     "AgentExecutor.timeout task_id=%s agent_type=%s",
@@ -103,7 +122,19 @@ class AgentExecutor:
         return json.dumps(task)
 
     def _parse_output(self, raw: str, agent_type: AgentType) -> AgentOutput:
-        body = json.loads(raw)
+        raw = raw.strip()
+        if not raw:
+            raise ValueError(
+                "Ollama returned an empty response. "
+                "This can happen when the Ollama server streams NDJSON 'thinking' fragments without a final 'response' field. "
+                "Verify the OllamaClient streaming behavior and inspect the raw NDJSON stream (for example via curl) to diagnose the issue. "
+                f"agent_type={agent_type.value}"
+            )
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Ollama returned invalid JSON: {exc}") from exc
+
         if agent_type == AgentType.PLANNER:
             return PlannerOutput.model_validate(body)
         if agent_type == AgentType.CODER:
@@ -116,12 +147,19 @@ class AgentExecutor:
             return SynthesizerOutput.model_validate(body)
         raise ValueError(f"Unsupported agent type: {agent_type}")
 
-    def _build_retry_prompt(self, prompt: str, exc: ValidationError) -> str:
+    def _build_retry_prompt(self, prompt: str, exc: Exception) -> str:
+        # Accept either a Pydantic ValidationError (has .errors()) or any
+        # other exception. Fall back to the exception message when errors()
+        # is not available.
+        try:
+            details = exc.errors()  # type: ignore[attr-defined]
+        except Exception:
+            details = [str(exc)]
         return (
             prompt
             + "\n\nThe previous response failed validation. Please return valid JSON conforming to the schema."
             + " Validation errors: "
-            + json.dumps(exc.errors())
+            + json.dumps(details)
         )
 
     def _select_model(self, agent_type: AgentType) -> str:

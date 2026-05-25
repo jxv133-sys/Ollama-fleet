@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,14 @@ class DummyExecutor:
     async def execute(self, task: dict[str, Any], agent_type: AgentType, extra_context: dict[str, Any] | None = None):
         # Simple deterministic behavior for demo purposes
         if agent_type == AgentType.PLANNER:
-            t = PlannerTask(task_id="task-1", title="Create demo module", description="Add demo.py with a greet() function", agent_type="coder", dependencies=[], priority=5)
+            t = PlannerTask(
+                task_id=f"demo-task-{uuid.uuid4().hex[:8]}",
+                title="Create demo module",
+                description="Add demo.py with a greet() function",
+                agent_type="coder",
+                dependencies=[],
+                priority=5,
+            )
             return PlannerOutput(tasks=[t], milestones=["demo-ready"], architecture_notes="demo arch")
 
         if agent_type == AgentType.CODER:

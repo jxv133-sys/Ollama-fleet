@@ -49,7 +49,7 @@ def write_toml(tmp_path: Path, content: str) -> Path:
 class TestDefaults:
     def test_ollama_defaults(self) -> None:
         cfg = OllamaConfig()
-        assert cfg.base_url == "http://192.168.50.142:7869/v1"
+        assert cfg.base_url == "http://192.168.50.142:7869"
         assert cfg.planner_model == "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
         assert cfg.coder_model == "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
         assert cfg.summarizer_model == "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"

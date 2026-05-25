@@ -72,11 +72,21 @@ class Orchestrator:
         )
         self._publish_event(
             {
+                "type": "workspace_created",
+                "workspace_path": str(workspace_manager.root),
+            }
+        )
+        self._publish_event(
+            {
                 "type": "job_state_changed",
                 "job_id": job_id,
                 "new_state": "submitted",
+                "goal": goal,
             }
         )
+        # Allow UI to render job submission
+        await asyncio.sleep(0.3)
+        
         workspace_manager.append_execution_history(
             {"event": "job_submitted", "job_id": job_id, "goal": goal}
         )
@@ -112,6 +122,51 @@ class Orchestrator:
 
         tasks = self._create_tasks_from_planner(planner_output, job_id)
         await self.scheduler.enqueue_tasks(tasks)
+        
+        # Publish planner output event for dashboard
+        self._publish_event({
+            "type": "agent_output",
+            "agent_type": AgentType.PLANNER.value,
+            "output": {
+                "tasks_created": len(tasks),
+                "milestones": planner_output.milestones,
+                "architecture": planner_output.architecture_notes[:100] if planner_output.architecture_notes else "",
+            }
+        })
+        
+        self._publish_event({
+            "type": "agent_log",
+            "message": f"[PLANNER] Created {len(tasks)} tasks ready for execution"
+        })
+        
+        # Save planner output to workspace
+        planner_output_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent_type": AgentType.PLANNER.value,
+            "tasks_created": len(tasks),
+            "milestones": planner_output.milestones,
+            "architecture_notes": planner_output.architecture_notes,
+            "tasks": [
+                {
+                    "task_id": t.task_id,
+                    "title": t.title,
+                    "description": t.description,
+                    "agent_type": t.agent_type,
+                    "dependencies": t.dependencies,
+                    "priority": t.priority,
+                }
+                for t in planner_output.tasks
+            ],
+        }
+        planner_count = len(list(workspace_manager.root.glob("agent_outputs/planner_*.json"))) + 1
+        workspace_manager.write_file(
+            f"agent_outputs/planner_{planner_count}.json",
+            json.dumps(planner_output_data, indent=2),
+        )
+        
+        # Allow UI to display planner tasks
+        await asyncio.sleep(0.3)
+        
         await self.dispatch_loop(job_id, workspace_manager, escalation_manager)
         return job_id
 
@@ -160,6 +215,8 @@ class Orchestrator:
                 "new_state": "running",
             }
         )
+        # Brief pause to allow UI to display task start
+        await asyncio.sleep(0.2)
 
         if task.agent_type == AgentType.CODER.value:
             await self._run_coder_task(task, workspace, escalation_manager)
@@ -177,6 +234,9 @@ class Orchestrator:
                     "new_state": "completed",
                 }
             )
+        
+        # Brief pause after task completion to allow UI to update
+        await asyncio.sleep(0.1)
 
     async def _recover_running_tasks(self) -> None:
         rows = await self.db.fetchall(
@@ -343,6 +403,35 @@ class Orchestrator:
         self._publish_event(
             {"type": "validation_result", "validation_result": vars(validation_result)}
         )
+        
+        # Save coder output to workspace
+        coder_output_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent_type": AgentType.CODER.value,
+            "task_id": task.task_id,
+            "summary": coder_output.summary,
+            "confidence_score": coder_output.confidence_score,
+            "file_modifications": [
+                {
+                    "file_path": mod.file_path,
+                    "content_preview": mod.content[:200] if len(mod.content) > 200 else mod.content,
+                    "content_length": len(mod.content),
+                }
+                for mod in coder_output.file_modifications
+            ],
+            "files_created": modified_files,
+            "validation": {
+                "syntax_ok": validation_result.syntax_ok,
+                "linter_available": validation_result.linter_available,
+                "lint_results": len(validation_result.lint_results),
+            },
+        }
+        coder_count = len(list(workspace_manager.root.glob("agent_outputs/coder_*.json"))) + 1
+        workspace_manager.write_file(
+            f"agent_outputs/coder_{coder_count}.json",
+            json.dumps(coder_output_data, indent=2),
+        )
+        
         if not validation_result.syntax_ok:
             await self.scheduler.transition(task.task_id, "pending")
             self._publish_event(
@@ -372,6 +461,41 @@ class Orchestrator:
                 "critic_issues": self.revision_issues.get(task.task_id, []),
             },
         )
+
+        # Publish critic output event for dashboard
+        self._publish_event({
+            "type": "agent_output",
+            "agent_type": AgentType.CRITIC.value,
+            "output": {
+                "approved": critic_output.approved if isinstance(critic_output, CriticOutput) else False,
+                "issues_found": len(critic_output.issues) if isinstance(critic_output, CriticOutput) else 0,
+                "assessment": critic_output.overall_assessment if isinstance(critic_output, CriticOutput) else "",
+            }
+        })
+        
+        # Save critic output to workspace
+        if isinstance(critic_output, CriticOutput):
+            critic_output_data = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "agent_type": AgentType.CRITIC.value,
+                "task_id": task.task_id,
+                "approved": critic_output.approved,
+                "overall_assessment": critic_output.overall_assessment,
+                "issues": [
+                    {
+                        "severity": issue.get("severity", "unknown"),
+                        "message": issue.get("message", ""),
+                        "line": issue.get("line", 0),
+                        "file": issue.get("file", ""),
+                    }
+                    for issue in critic_output.issues
+                ],
+            }
+            critic_count = len(list(workspace_manager.root.glob("agent_outputs/critic_*.json"))) + 1
+            workspace_manager.write_file(
+                f"agent_outputs/critic_{critic_count}.json",
+                json.dumps(critic_output_data, indent=2),
+            )
 
         if isinstance(critic_output, CriticOutput) and not critic_output.approved:
             await self._handle_critic_output(task, critic_output, escalation_manager)
@@ -463,7 +587,7 @@ class Orchestrator:
         )
 
     async def _run_tester_task(self, task: ScheduledTask) -> None:
-        await self.executor.execute(
+        tester_output = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -472,10 +596,30 @@ class Orchestrator:
             AgentType.TESTER,
             extra_context={"workspace_state": "", "test_results": ""},
         )
+        if isinstance(tester_output, TesterOutput):
+            self._publish_event(
+                {
+                    "type": "agent_output",
+                    "agent_type": AgentType.TESTER.value,
+                    "output": {
+                        "tests_passed": tester_output.tests_passed,
+                        "tests_failed": tester_output.tests_failed,
+                        "ready_for_review": tester_output.ready_for_review,
+                    },
+                }
+            )
         await self.scheduler.transition(task.task_id, "completed")
+        self._publish_event(
+            {
+                "type": "task_state_changed",
+                "task_id": task.task_id,
+                "agent_type": task.agent_type,
+                "new_state": "completed",
+            }
+        )
 
     async def _run_synthesizer_task(self, task: ScheduledTask) -> None:
-        await self.executor.execute(
+        synthesizer_output = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -488,7 +632,26 @@ class Orchestrator:
                 "files_produced": [],
             },
         )
+        if isinstance(synthesizer_output, SynthesizerOutput):
+            self._publish_event(
+                {
+                    "type": "agent_output",
+                    "agent_type": AgentType.SYNTHESIZER.value,
+                    "output": {
+                        "summary": synthesizer_output.summary,
+                        "files_produced": synthesizer_output.files_produced,
+                    },
+                }
+            )
         await self.scheduler.transition(task.task_id, "completed")
+        self._publish_event(
+            {
+                "type": "task_state_changed",
+                "task_id": task.task_id,
+                "agent_type": task.agent_type,
+                "new_state": "completed",
+            }
+        )
 
     async def _check_stall(self) -> None:
         """Background coroutine: detect stalled jobs and escalate them.
@@ -502,10 +665,10 @@ class Orchestrator:
                 await asyncio.sleep(60)
                 # Find running tasks across jobs and check per-task progress
                 rows = await self.db.fetchall(
-                    "SELECT task_id, job_id, updated_at, retry_count FROM tasks WHERE state = 'running'"
+                    "SELECT task_id, job_id, agent_type, updated_at, retry_count FROM tasks WHERE state = 'running'"
                 )
                 now_ts = datetime.now(timezone.utc).timestamp()
-                for task_id, job_id, updated_at, retry_count in rows:
+                for task_id, job_id, agent_type, updated_at, retry_count in rows:
                     if updated_at is None:
                         continue
                     try:
@@ -536,8 +699,16 @@ class Orchestrator:
                             except Exception:
                                 # best-effort: continue even if workspace unavailable
                                 pass
-                        await self._publish_event({"type": "task_state_changed", "task_id": task_id, "new_state": "failed"})
-                        await self._publish_event({"type": "agent_log", "message": f"Task {task_id} failed: stalled and retry limit exceeded."})
+                        await self._publish_event({
+                            "type": "task_state_changed",
+                            "task_id": task_id,
+                            "agent_type": agent_type,
+                            "new_state": "failed",
+                        })
+                        await self._publish_event({
+                            "type": "agent_log",
+                            "message": f"Task {task_id} failed: stalled and retry limit exceeded.",
+                        })
                         continue
 
                     # Otherwise increment retry and requeue the task to pending
@@ -562,8 +733,16 @@ class Orchestrator:
                             except Exception:
                                 pass
 
-                        await self._publish_event({"type": "task_state_changed", "task_id": task_id, "new_state": "pending"})
-                        await self._publish_event({"type": "agent_log", "message": f"Task {task_id} requeued after stall; retry {new_retry}."})
+                        await self._publish_event({
+                            "type": "task_state_changed",
+                            "task_id": task_id,
+                            "agent_type": agent_type,
+                            "new_state": "pending",
+                        })
+                        await self._publish_event({
+                            "type": "agent_log",
+                            "message": f"Task {task_id} requeued after stall; retry {new_retry}.",
+                        })
                     except Exception:
                         logger.exception("Failed handling stalled task %s", task_id)
             except asyncio.CancelledError:

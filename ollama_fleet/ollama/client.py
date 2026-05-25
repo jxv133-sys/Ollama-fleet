@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
+from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaConnectionError(Exception):
@@ -48,7 +52,7 @@ class OllamaClient:
             ``http://localhost:11434``.
     """
 
-    def __init__(self, base_url: str = "http://192.168.50.142:7869/v1") -> None:
+    def __init__(self, base_url: str = "http://192.168.50.142:7869") -> None:
         self.base_url = base_url.rstrip("/")
 
     async def generate(self, model: str, prompt: str, timeout: float) -> str:
@@ -78,7 +82,16 @@ class OllamaClient:
         payload = {"model": model, "prompt": prompt, "format": "json"}
 
         try:
-            async with httpx.AsyncClient() as client:
+            timeout_config = httpx.Timeout(timeout, connect=10.0, read=timeout, write=timeout, pool=timeout)
+            try:
+                client_cm = httpx.AsyncClient(http2=False, trust_env=False, headers={"Accept-Encoding": "identity"})
+            except TypeError:
+                # Some test helpers patch AsyncClient with a callable that doesn't
+                # accept kwargs. Fall back to calling without kwargs so tests
+                # and older httpx versions continue to work.
+                client_cm = httpx.AsyncClient()
+
+            async with client_cm as client:
                 async with client.stream(
                     "POST",
                     url,
@@ -94,15 +107,89 @@ class OllamaClient:
                         )
 
                     full_response: list[str] = []
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        chunk = json.loads(line)
-                        full_response.append(chunk.get("response", ""))
-                        if chunk.get("done"):
-                            break
+                    done = False
 
-                    return "".join(full_response)
+                    async def _process_line(line: str) -> bool:
+                        line = line.strip()
+                        if not line:
+                            return False
+                        try:
+                            chunk_obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "OllamaClient.invalid_stream_chunk line=%r",
+                                line,
+                            )
+                            return False
+
+                        response_chunk = chunk_obj.get("response", "")
+                        thinking_chunk = chunk_obj.get("thinking", "")
+                        if response_chunk:
+                            full_response.append(response_chunk)
+                        elif thinking_chunk:
+                            full_response.append(thinking_chunk)
+                        return bool(chunk_obj.get("done"))
+
+                    # Prefer byte-level iteration to correctly handle servers that
+                    # stream partial JSON tokens across chunks. This is more robust
+                    # across httpx versions and real-world Ollama servers. Fall
+                    # back to line-level iteration or a final read if bytes
+                    # iteration is unavailable.
+                    buffer = bytearray()
+                    if hasattr(resp, "aiter_bytes"):
+                        async for chunk in resp.aiter_bytes():
+                            if not chunk:
+                                continue
+                            buffer.extend(chunk)
+                            while True:
+                                newline_index = buffer.find(b"\n")
+                                if newline_index == -1:
+                                    break
+                                line_bytes = bytes(buffer[:newline_index])
+                                del buffer[: newline_index + 1]
+                                line_str = line_bytes.decode("utf-8", errors="replace")
+                                logger.debug("OllamaClient.stream_line %r", line_str)
+                                if await _process_line(line_str):
+                                    done = True
+                                    break
+                            if done:
+                                break
+                        if not done and buffer:
+                            tail = buffer.decode("utf-8", errors="replace").strip()
+                            if tail:
+                                logger.debug("OllamaClient.stream_tail %r", tail)
+                                await _process_line(tail)
+                    elif hasattr(resp, "aiter_lines"):
+                        async for line in resp.aiter_lines():
+                            logger.debug("OllamaClient.stream_line %r", line)
+                            if await _process_line(line):
+                                done = True
+                                break
+                    else:
+                        # Last-resort: read the remaining body in one go.
+                        tail = await resp.aread()
+                        tail_str = tail.decode("utf-8", errors="replace").strip()
+                        if tail_str:
+                            logger.debug("OllamaClient.stream_read %r", tail_str)
+                            await _process_line(tail_str)
+
+                    joined = "".join(full_response).strip()
+                    if not joined:
+                        return joined
+
+                    # If the accumulated chunks look like JSON, try to
+                    # validate them before returning so callers (agents)
+                    # that expect a structured payload can proceed.
+                    first_char = joined[0]
+                    if first_char in ("{", "["):
+                        try:
+                            json.loads(joined)
+                            logger.debug("OllamaClient.generated_valid_json")
+                            return joined
+                        except json.JSONDecodeError:
+                            logger.debug("OllamaClient.generated_invalid_json_attempt", extra={"sample": joined[:200]})
+
+                    return joined
 
         except OllamaHTTPError:
             # Re-raise our own typed errors without wrapping them.
@@ -115,3 +202,33 @@ class OllamaClient:
             raise OllamaTimeoutError(
                 f"Request to Ollama timed out after {timeout}s: {exc}"
             ) from exc
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        """Return the list of models available on the Ollama server.
+
+        Performs a GET request to ``/api/models`` and returns the parsed JSON
+        response which is expected to be a list of model metadata objects.
+        """
+        endpoints = ["/api/models", "/models"]
+        last_err: Exception | None = None
+        async with httpx.AsyncClient() as client:
+            for ep in endpoints:
+                url = f"{self.base_url}{ep}"
+                try:
+                    resp = await client.get(url, timeout=10.0)
+                    if resp.status_code == 404:
+                        # try the next candidate endpoint
+                        last_err = OllamaHTTPError(status_code=resp.status_code, body=resp.text)
+                        continue
+                    if resp.status_code >= 400:
+                        raise OllamaHTTPError(status_code=resp.status_code, body=resp.text)
+                    return resp.json()
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_err = OllamaConnectionError(f"Could not connect to Ollama at {self.base_url}: {exc}")
+                    break
+
+        # If we get here, none of the endpoints succeeded. Raise the last error if present,
+        # otherwise return an empty list to allow callers to fall back.
+        if last_err:
+            raise last_err
+        return []
