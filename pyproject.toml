@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ollama-fleet"
+version = "0.1.0"
+description = "Production-grade local AI orchestration platform"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx[asyncio]>=0.27",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "textual>=0.61",
+    "rich>=13",
+    "aiosqlite>=0.20",
+    # tomllib is in stdlib for Python 3.11+; tomli is the backport for older versions
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+ollama-fleet = "ollama_fleet.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis>=6.100",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+
+# ---------------------------------------------------------------------------
+# Hypothesis
+# ---------------------------------------------------------------------------
+[tool.hypothesis]
+max_examples = 100
+# Suppress the health-check that fires when tests run in CI with low entropy
+suppress_health_check = ["too_slow"]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["ollama_fleet", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+    "ANN", # flake8-annotations (type hints)
+    "S",   # flake8-bandit (security)
+    "RUF", # Ruff-specific rules
+]
+ignore = [
+    "ANN101", # missing type annotation for `self`
+    "ANN102", # missing type annotation for `cls`
+    "S101",   # use of assert (fine in tests)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "S"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ollama_fleet"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
