@@ -9,11 +9,29 @@ def build_critic_prompt(
     lint_results: list[dict[str, str]],
     critic_issues: list[dict[str, Any]] | None = None,
 ) -> str:
+    schema_example = """{
+  "approved": false,
+  "issues": [
+    {
+      "file_path": "src/module.py",
+      "line_number": 42,
+      "severity": "major",
+      "description": "Issue description",
+      "suggested_fix": "How to fix it"
+    }
+  ],
+  "overall_assessment": "Overall assessment of the code changes."
+}"""
     lines: list[str] = [
-        "You are Critic_Agent. Review the provided code modifications and return a JSON object matching the CriticOutput schema.",
-        "Evaluate code quality, correctness, and adherence to best practices.",
-        "Include all issues found and provide an overall assessment.",
-        "Respond with only valid JSON.",
+        "You are Critic_Agent. Your ONLY task is to return valid JSON.",
+        "\nRESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.",
+        "\nJSON SCHEMA REQUIREMENTS:",
+        "- approved: boolean (true if code is acceptable, false if issues found)",
+        "- issues: array of objects, EACH with: file_path (string), line_number (integer, 0 for file-level), severity (string: 'critical'|'major'|'minor'), description (string), suggested_fix (string)",
+        "- overall_assessment: single STRING summarizing the review",
+        "\nEXAMPLE OUTPUT:",
+        schema_example,
+        "\nReview the following code modifications:",
         "\nModified files:\n",
     ]
     for path in modified_files:

@@ -121,6 +121,63 @@ class AgentExecutor:
             )
         return json.dumps(task)
 
+    def _normalize_planner_output(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize Planner output: fix field names, types, flatten structures."""
+        # Normalize tasks: map 'id' -> 'task_id' and ensure all required fields
+        for i, task in enumerate(data.get("tasks", [])):
+            if "id" in task and "task_id" not in task:
+                task["task_id"] = task.pop("id")
+            # Ensure title exists
+            if "title" not in task and "description" in task:
+                task["title"] = task["description"][:50]
+            # Ensure agent_type exists
+            if "agent_type" not in task:
+                task["agent_type"] = "coder"
+        
+        # Flatten milestones if they're objects
+        if data.get("milestones") and isinstance(data["milestones"][0], dict):
+            data["milestones"] = [
+                m.get("title", str(m)) for m in data["milestones"]
+            ]
+        
+        # Flatten architecture_notes if it's a list
+        if data.get("architecture_notes") and isinstance(data["architecture_notes"], list):
+            data["architecture_notes"] = " ".join([
+                n.get("note", str(n)) for n in data["architecture_notes"]
+            ])
+        
+        return data
+
+    def _normalize_coder_output(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize Coder output: ensure required fields."""
+        # Normalize file_modifications
+        for mod in data.get("file_modifications", []):
+            if "path" in mod and "file_path" not in mod:
+                mod["file_path"] = mod.pop("path")
+            if "content" not in mod:
+                mod["content"] = ""
+        
+        # Ensure confidence_score exists and is in range
+        if "confidence_score" not in data:
+            data["confidence_score"] = 0.5
+        else:
+            try:
+                score = float(data["confidence_score"])
+                data["confidence_score"] = max(0.0, min(1.0, score))
+            except (ValueError, TypeError):
+                data["confidence_score"] = 0.5
+        
+        return data
+
+    def _normalize_critic_output(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize Critic output: ensure issue structure."""
+        # Normalize issues
+        for issue in data.get("issues", []):
+            if "line_number" not in issue:
+                issue["line_number"] = 0
+        
+        return data
+
     def _parse_output(self, raw: str, agent_type: AgentType) -> AgentOutput:
         raw = raw.strip()
         if not raw:
@@ -130,18 +187,32 @@ class AgentExecutor:
                 "Verify the OllamaClient streaming behavior and inspect the raw NDJSON stream (for example via curl) to diagnose the issue. "
                 f"agent_type={agent_type.value}"
             )
+        # Extraction wrapper: try to extract JSON from messy output
         try:
             body = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Ollama returned invalid JSON: {exc}") from exc
+        except json.JSONDecodeError:
+            # Try to extract the first {...} or [...] block
+            import re
+            match = re.search(r'({.*}|\[.*\])', raw, re.DOTALL)
+            if match:
+                try:
+                    body = json.loads(match.group(1))
+                except Exception as exc2:
+                    raise ValueError(f"Ollama returned invalid JSON (after extraction): {exc2}")
+            else:
+                raise ValueError(f"Ollama returned invalid JSON: {raw[:200]}")
 
+        # Apply agent-specific normalization before validation
         if agent_type == AgentType.PLANNER:
+            body = self._normalize_planner_output(body)
             return PlannerOutput.model_validate(body)
         if agent_type == AgentType.CODER:
+            body = self._normalize_coder_output(body)
             return CoderOutput.model_validate(body)
         if agent_type == AgentType.TESTER:
             return TesterOutput.model_validate(body)
         if agent_type == AgentType.CRITIC:
+            body = self._normalize_critic_output(body)
             return CriticOutput.model_validate(body)
         if agent_type == AgentType.SYNTHESIZER:
             return SynthesizerOutput.model_validate(body)

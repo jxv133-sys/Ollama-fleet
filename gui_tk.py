@@ -365,7 +365,12 @@ class FleetTkApp(tk.Tk):
         if self._job_running and self.start_time:
             elapsed = int(time.time() - self.start_time)
             self.elapsed_var.set(f"{elapsed}s")
-            self.after(1000, self._update_elapsed_time)
+            # Only schedule next update if window is still valid
+            try:
+                self.after(1000, self._update_elapsed_time)
+            except tk.TclError:
+                # Window has been destroyed
+                pass
 
     def _poll(self) -> None:
         """Poll events from queue and update UI."""
@@ -375,7 +380,12 @@ class FleetTkApp(tk.Tk):
                 self._process_event(event)
         except queue.Empty:
             pass
-        self.after(100, self._poll)
+        # Only schedule next poll if window is still valid
+        try:
+            self.after(100, self._poll)
+        except tk.TclError:
+            # Window has been destroyed
+            pass
 
     def _process_event(self, event: dict[str, Any]) -> None:
         """Process a single event from the orchestrator."""

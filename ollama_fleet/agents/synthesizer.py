@@ -8,11 +8,23 @@ def build_synthesizer_prompt(
     completed_summaries: list[str],
     files_produced: list[str],
 ) -> str:
+    schema_example = """{
+  "summary": "Comprehensive summary of all completed work",
+  "changelog": ["Change 1", "Change 2"],
+  "files_produced": ["src/file1.py", "src/file2.py"],
+  "next_steps": ["Step 1", "Step 2"]
+}"""
     lines: list[str] = [
-        "You are Synthesizer_Agent. Produce a JSON object matching the SynthesizerOutput schema.",
-        "Summarize the completed work, list produced files, and propose next steps.",
-        "Respond with only valid JSON.",
-        f"Goal: {goal}",
+        "You are Synthesizer_Agent. Your ONLY task is to return valid JSON.",
+        "\nRESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.",
+        "\nJSON SCHEMA REQUIREMENTS:",
+        "- summary: STRING summarizing all completed work",
+        "- changelog: array of STRINGS describing each change",
+        "- files_produced: array of STRINGS listing all produced files",
+        "- next_steps: array of STRINGS proposing next steps",
+        "\nEXAMPLE OUTPUT:",
+        schema_example,
+        f"\nGoal: {goal}",
         "\nCompleted task summaries:\n",
     ]
     if completed_summaries:

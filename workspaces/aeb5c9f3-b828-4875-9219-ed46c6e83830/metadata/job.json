@@ -1,0 +1,8 @@
+{
+  "job_id": "aeb5c9f3-b828-4875-9219-ed46c6e83830",
+  "goal": "Test Goal",
+  "created_at": "2026-05-25T21:58:33.385223+00:00",
+  "config": {
+    "source": "gui_tk"
+  }
+}

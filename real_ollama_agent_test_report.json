@@ -1,0 +1,96 @@
+{
+  "timestamp": "2026-05-25T21:55:38.581869+00:00",
+  "test_type": "Real Ollama Agent Direct Execution",
+  "ollama_server": "http://192.168.50.142:7869",
+  "results": [
+    {
+      "test": "Planner: Simple Python Module",
+      "status": "success",
+      "elapsed_ms": 410825.25,
+      "output_type": "PlannerOutput",
+      "output": {
+        "tasks": [
+          {
+            "task_id": "task_001",
+            "title": "Create Python Module Structure",
+            "description": "Initialize a new Python file for the module and set up basic structure.",
+            "agent_type": "coder",
+            "dependencies": [],
+            "priority": 1
+          },
+          {
+            "task_id": "task_002",
+            "title": "Define Sum Function",
+            "description": "Implement a function that takes two numbers as arguments and returns their sum.",
+            "agent_type": "coder",
+            "dependencies": [
+              "task_001"
+            ],
+            "priority": 2
+          },
+          {
+            "task_id": "task_003",
+            "title": "Write Unit Tests for Sum Function",
+            "description": "Create unit tests to verify the correctness of the sum function with various inputs.",
+            "agent_type": "tester",
+            "dependencies": [
+              "task_002"
+            ],
+            "priority": 3
+          },
+          {
+            "task_id": "task_004",
+            "title": "Run Tests and Fix Bugs",
+            "description": "Execute the tests and fix any bugs that arise.",
+            "agent_type": "tester",
+            "dependencies": [
+              "task_003"
+            ],
+            "priority": 4
+          },
+          {
+            "task_id": "task_005",
+            "title": "Document Module and Function",
+            "description": "Add comments and docstrings to the module and function for clarity.",
+            "agent_type": "synthesizer",
+            "dependencies": [
+              "task_004"
+            ],
+            "priority": 5
+          },
+          {
+            "task_id": "task_006",
+            "title": "Prepare Module for Distribution",
+            "description": "Package the module and prepare it for distribution, if necessary.",
+            "agent_type": "synthesizer",
+            "dependencies": [
+              "task_005"
+            ],
+            "priority": 6
+          }
+        ],
+        "milestones": [
+          "Module structure created",
+          "Sum function implemented",
+          "Unit tests written",
+          "Bugs fixed and tested",
+          "Documentation added",
+          "Module prepared for distribution"
+        ],
+        "architecture_notes": "The module will consist of a single file with one function that performs the addition of two numbers. Basic error handling will be included to ensure inputs are valid numbers."
+      }
+    },
+    {
+      "test": "Coder: Implement Function",
+      "status": "error",
+      "elapsed_ms": 506.87,
+      "error": "Ollama HTTP error 500: {\"error\":\"unable to load model: /root/.ollama/models/blobs/sha256-f6fc5d193045796d9e1870cbc40f827fe55f53f70593c3f5c1968b82b9331991\"}"
+    }
+  ],
+  "summary": {
+    "total": 2,
+    "success": 1,
+    "timeout": 0,
+    "error": 1
+  }
+}
