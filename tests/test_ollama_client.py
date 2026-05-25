@@ -283,9 +283,9 @@ async def test_generate_raises_timeout_error_on_pool_timeout():
 
 
 def test_client_default_base_url():
-    """OllamaClient defaults to http://localhost:11434."""
+    """OllamaClient defaults to http://192.168.50.142:7869/v1."""
     client = OllamaClient()
-    assert client.base_url == "http://localhost:11434"
+    assert client.base_url == "http://192.168.50.142:7869/v1"
 
 
 def test_client_custom_base_url():

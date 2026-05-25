@@ -48,7 +48,7 @@ class OllamaClient:
             ``http://localhost:11434``.
     """
 
-    def __init__(self, base_url: str = "http://localhost:11434") -> None:
+    def __init__(self, base_url: str = "http://192.168.50.142:7869/v1") -> None:
         self.base_url = base_url.rstrip("/")
 
     async def generate(self, model: str, prompt: str, timeout: float) -> str:
