@@ -1,0 +1,19 @@
+{
+  "timestamp": "2026-05-25T20:41:04.145179+00:00",
+  "agent_type": "planner",
+  "tasks_created": 1,
+  "milestones": [
+    "demo-ready"
+  ],
+  "architecture_notes": "demo arch",
+  "tasks": [
+    {
+      "task_id": "demo-task-1ae1b173",
+      "title": "Create demo module",
+      "description": "Add demo.py with a greet() function",
+      "agent_type": "coder",
+      "dependencies": [],
+      "priority": 5
+    }
+  ]
+}
