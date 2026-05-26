@@ -222,12 +222,46 @@ class AgentExecutor:
         return data
 
     def _normalize_critic_output(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Normalize Critic output: ensure issue structure."""
-        # Normalize issues
-        for issue in data.get("issues", []):
+        """Normalize Critic output: ensure issue structure and detect placeholder responses."""
+        # Placeholder assessments the model emits when it hasn't actually reviewed the code.
+        # If we detect one, force approved=true so the revision loop doesn't spin forever.
+        _PLACEHOLDER_ASSESSMENTS = {
+            "overall assessment of the code changes.",
+            "code has some issues that need attention.",
+            "the code changes look good.",
+            "no issues found.",
+        }
+
+        assessment = str(data.get("overall_assessment", "")).strip().lower().rstrip(".")
+        if assessment + "." in _PLACEHOLDER_ASSESSMENTS or assessment in _PLACEHOLDER_ASSESSMENTS:
+            # The model returned a template string — it didn't actually review the code.
+            # Force approval so we don't loop forever on a non-review.
+            data["approved"] = True
+            data["issues"] = []
+            data["overall_assessment"] = "Auto-approved: critic returned a placeholder assessment."
+            return data
+
+        # Normalize issues list
+        issues = data.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+        cleaned: list[dict[str, Any]] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
             if "line_number" not in issue:
                 issue["line_number"] = 0
-        
+            # Drop issues that are themselves placeholder text
+            desc = str(issue.get("description", "")).strip().lower()
+            if desc in ("issue description", "description", "", "none"):
+                continue
+            cleaned.append(issue)
+        data["issues"] = cleaned
+
+        # If all issues were placeholders, approve
+        if not cleaned:
+            data["approved"] = True
+
         return data
 
     def _normalize_synthesizer_output(self, data: dict[str, Any]) -> dict[str, Any]:

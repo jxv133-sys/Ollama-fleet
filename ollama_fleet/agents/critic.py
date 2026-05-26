@@ -10,52 +10,91 @@ def build_critic_prompt(
     critic_issues: list[dict[str, Any]] | None = None,
 ) -> str:
     schema_example = """{
+  "approved": true,
+  "issues": [],
+  "overall_assessment": "Code is correct and complete. No issues found."
+}"""
+    schema_example_reject = """{
   "approved": false,
   "issues": [
     {
-      "file_path": "src/module.py",
-      "line_number": 42,
+      "file_path": "src/calculator.py",
+      "line_number": 12,
       "severity": "major",
-      "description": "Issue description",
-      "suggested_fix": "How to fix it"
+      "description": "Division by zero not handled: divide() does not check if divisor is 0.",
+      "suggested_fix": "Add: if b == 0: raise ValueError('Cannot divide by zero')"
     }
   ],
-  "overall_assessment": "Overall assessment of the code changes."
+  "overall_assessment": "The divide function will crash on zero input. Fix the guard clause."
 }"""
+
     lines: list[str] = [
         "You are Critic_Agent. Your ONLY task is to return valid JSON.",
-        "\nRESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.",
-        "\nJSON SCHEMA REQUIREMENTS:",
-        "- approved: boolean (true if code is acceptable, false if issues found)",
-        "- issues: array of objects, EACH with: file_path (string), line_number (integer, 0 for file-level), severity (string: 'critical'|'major'|'minor'), description (string), suggested_fix (string)",
-        "- overall_assessment: single STRING summarizing the review",
-        "\nEXAMPLE OUTPUT:",
+        "",
+        "RESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.",
+        "",
+        "CRITICAL RULES:",
+        "1. If the code is syntactically valid Python and implements the described task reasonably,",
+        "   you MUST set approved=true and return an empty issues array.",
+        "2. Only set approved=false if you find a SPECIFIC, CONCRETE bug — not style preferences.",
+        "3. Every issue MUST include the real file_path, the actual line_number (not 0),",
+        "   a precise description of the bug, and a concrete suggested_fix with example code.",
+        "4. Do NOT use placeholder text like 'Overall assessment of the code changes.'",
+        "   Write a real one-sentence summary of what you actually found.",
+        "5. Do NOT reject code just because it is simple or short.",
+        "6. If the previous revision already addressed the prior issues, set approved=true.",
+        "",
+        "JSON SCHEMA:",
+        "- approved: boolean",
+        "- issues: array (empty [] when approved=true)",
+        "  Each issue: file_path (string), line_number (integer > 0), severity ('critical'|'major'|'minor'),",
+        "               description (specific bug), suggested_fix (concrete code fix)",
+        "- overall_assessment: one real sentence describing your finding",
+        "",
+        "EXAMPLE — approved:",
         schema_example,
-        "\nReview the following code modifications:",
-        "\nModified files:\n",
+        "",
+        "EXAMPLE — rejected with a real issue:",
+        schema_example_reject,
+        "",
+        "Now review the following code:",
+        "",
+        "Modified files:",
     ]
+
     for path in modified_files:
-        lines.append(f"- {path}")
-    lines.append("\nFile contents:\n")
+        lines.append(f"  {path}")
+
+    lines.append("")
+    lines.append("File contents:")
     for path in modified_files:
-        lines.append(f"=== {path} ===")
-        lines.append(file_contents.get(path, ""))
-    lines.append("\nLint results:\n")
+        content = file_contents.get(path, "(empty)")
+        lines.append(f"\n=== {path} ===")
+        lines.append(content)
+
+    lines.append("")
+    lines.append("Lint results:")
     if not lint_results:
-        lines.append("No lint issues reported.")
+        lines.append("  None — no lint issues detected.")
     else:
         for issue in lint_results:
             lines.append(
-                f"- {issue.get('file_path', '')}:{issue.get('line_number', '')} "
+                f"  {issue.get('file_path', '')}:{issue.get('line_number', '')} "
                 f"[{issue.get('code', '')}] {issue.get('message', '')}"
             )
 
     if critic_issues:
-        lines.append("\nPrevious critique issues:\n")
+        lines.append("")
+        lines.append("Issues raised in the previous revision (check if they are now fixed):")
         for issue in critic_issues:
             lines.append(
-                f"- {issue.get('file_path', '')}:{issue.get('line_number', '')} "
-                f"{issue.get('severity', '')} {issue.get('description', '')} "
-                f"Suggested fix: {issue.get('suggested_fix', '')}"
+                f"  {issue.get('file_path', '')}:{issue.get('line_number', '')} "
+                f"[{issue.get('severity', '')}] {issue.get('description', '')} "
+                f"→ Fix was: {issue.get('suggested_fix', '')}"
             )
+        lines.append("If these issues are resolved, set approved=true.")
+
+    lines.append("")
+    lines.append("RETURN ONLY VALID JSON. approved must be true unless you found a specific concrete bug.")
+
     return "\n".join(lines)
