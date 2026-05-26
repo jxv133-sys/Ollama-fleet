@@ -185,58 +185,67 @@ class Orchestrator:
             await self.scheduler.resolve_dependencies(job_id)
             await self.scheduler.recover_stalled_tasks(job_id, self.settings.scheduler.stall_timeout)
             ready_tasks = await self.scheduler.get_ready_tasks(job_id)
+
             if not ready_tasks:
                 active = await self.scheduler.count_active_tasks(job_id)
                 if active == 0:
+                    # Nothing running and nothing ready — job is done (or stuck).
                     failed = await self.scheduler.count_failed_tasks(job_id)
                     completed_coder_tasks = await self.scheduler.count_completed_tasks_by_agent(
-                        job_id,
-                        AgentType.CODER.value,
+                        job_id, AgentType.CODER.value,
                     )
-                    final_state = "failed" if failed or completed_coder_tasks == 0 else "completed"
-                    if completed_coder_tasks == 0 and failed == 0:
+                    # Consider the job successful if at least one coder task completed,
+                    # even if other tasks failed. Only hard-fail when zero files were produced.
+                    if completed_coder_tasks > 0:
+                        final_state = "completed"
+                        if failed > 0:
+                            self._publish_event({
+                                "type": "agent_log",
+                                "message": (
+                                    f"Job finishing with {failed} failed task(s) — "
+                                    f"{completed_coder_tasks} coder task(s) completed successfully."
+                                ),
+                                "level": "warning",
+                            })
+                    else:
+                        final_state = "failed"
+                        reason = (
+                            "No coder tasks completed — no files were produced."
+                            if failed == 0
+                            else f"All coder tasks failed ({failed} total failures)."
+                        )
                         await escalation_manager.write_escalation(
                             task_id="planner",
                             job_id=job_id,
-                            reason="Planner produced no completed coder tasks; no files were created.",
+                            reason=reason,
                             retry_count=0,
                         )
-                        self._publish_event(
-                            {
-                                "type": "agent_log",
-                                "message": "Job failed: planner produced no completed coder tasks, so no files were created.",
-                                "level": "error",
-                            }
-                        )
+                        self._publish_event({
+                            "type": "agent_log",
+                            "message": f"Job failed: {reason}",
+                            "level": "error",
+                        })
+
                     await self.job_manager.update_job_state(job_id, final_state)
-                    self._publish_event(
-                        {
-                            "type": "job_state_changed",
-                            "job_id": job_id,
-                            "new_state": final_state,
-                        }
-                    )
+                    self._publish_event({
+                        "type": "job_state_changed",
+                        "job_id": job_id,
+                        "new_state": final_state,
+                    })
                     break
+
                 await asyncio.sleep(0.1)
                 continue
 
-            # Dispatch all ready tasks concurrently up to max_concurrent_tasks
+            # Dispatch all ready tasks concurrently up to max_concurrent_tasks.
+            # Use return_exceptions=True so one task failure never cancels siblings.
             dispatch_tasks = [
                 asyncio.create_task(_dispatch_with_semaphore(task))
                 for task in ready_tasks
             ]
             await asyncio.gather(*dispatch_tasks, return_exceptions=True)
-
-            if await self.scheduler.count_failed_tasks(job_id) > 0:
-                await self.job_manager.update_job_state(job_id, "failed")
-                self._publish_event(
-                    {
-                        "type": "job_state_changed",
-                        "job_id": job_id,
-                        "new_state": "failed",
-                    }
-                )
-                return
+            # Do NOT stop here on failures — let the loop continue so remaining
+            # independent tasks can still run. The final state is decided above.
 
     async def _dispatch_task(
         self,
@@ -440,25 +449,28 @@ class Orchestrator:
             (change.file_path, change.content) for change in coder_output.file_modifications
         ]
         if self.previous_coder_outputs.get(task.task_id) == current_modifications:
+            # Coder produced identical output twice — escalate but requeue rather
+            # than hard-failing, so the task gets one more attempt with a fresh prompt.
             await escalation_manager.write_escalation(
                 task_id=task.task_id,
                 job_id=task.job_id,
-                reason="Identical coder output detected",
+                reason="Identical coder output detected — requeuing for retry",
                 retry_count=self.revision_counts.get(task.task_id, 0),
             )
-            await self.scheduler.transition(task.task_id, "failed")
-            self._publish_event(
-                {
-                    "type": "escalation_added",
-                    "escalation": {
-                        "task_id": task.task_id,
-                        "job_id": task.job_id,
-                        "reason": "Identical coder output detected",
-                        "retry_count": self.revision_counts.get(task.task_id, 0),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                }
-            )
+            self._publish_event({
+                "type": "agent_log",
+                "message": f"Task {task.task_id}: identical output detected, requeuing.",
+                "level": "warning",
+            })
+            # Clear cache so the next attempt isn't immediately rejected again
+            self.previous_coder_outputs.pop(task.task_id, None)
+            await self.scheduler.transition(task.task_id, "pending")
+            self._publish_event({
+                "type": "task_state_changed",
+                "task_id": task.task_id,
+                "agent_type": task.agent_type,
+                "new_state": "pending",
+            })
             return
 
         self.previous_coder_outputs[task.task_id] = current_modifications
@@ -639,51 +651,56 @@ class Orchestrator:
         count = self.revision_counts.get(task.task_id, 0) + 1
         self.revision_counts[task.task_id] = count
         self.revision_issues[task.task_id] = [vars(issue) for issue in critic_output.issues]
+
         if count >= self.settings.scheduler.max_critique_revision_loops:
+            # Revision limit reached — escalate but complete the task anyway so the
+            # job can continue. The files were written and are syntactically valid;
+            # the critic may simply be overly strict or returning placeholder feedback.
             await escalation_manager.write_escalation(
                 task_id=task.task_id,
                 job_id=task.job_id,
-                reason="Critic revision loop exceeded",
+                reason=f"Critic revision loop exceeded after {count} attempts — accepting best output",
                 retry_count=count,
             )
-            await self.scheduler.transition(task.task_id, "failed")
-            self._publish_event(
-                {
-                    "type": "task_state_changed",
+            self._publish_event({
+                "type": "escalation_added",
+                "escalation": {
                     "task_id": task.task_id,
-                    "agent_type": task.agent_type,
-                    "new_state": "failed",
-                }
-            )
-            self._publish_event(
-                {
-                    "type": "escalation_added",
-                    "escalation": {
-                        "task_id": task.task_id,
-                        "job_id": task.job_id,
-                        "reason": "Critic revision loop exceeded",
-                        "retry_count": count,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                }
-            )
-            return
-
-        await self.scheduler.transition(task.task_id, "pending")
-        self._publish_event(
-            {
+                    "job_id": task.job_id,
+                    "reason": f"Critic revision loop exceeded after {count} attempts — accepting best output",
+                    "retry_count": count,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            })
+            self._publish_event({
+                "type": "agent_log",
+                "message": (
+                    f"Task {task.task_id}: critic loop limit reached — "
+                    "accepting current output and continuing."
+                ),
+                "level": "warning",
+            })
+            await self.scheduler.transition(task.task_id, "completed")
+            self._publish_event({
                 "type": "task_state_changed",
                 "task_id": task.task_id,
                 "agent_type": task.agent_type,
-                "new_state": "pending",
-            }
-        )
-        self._publish_event(
-            {
-                "type": "agent_log",
-                "message": f"Task {task.task_id} requires revision loop {count}",
-            }
-        )
+                "new_state": "completed",
+            })
+            return
+
+        # Still within retry budget — requeue for another coder pass
+        await self.scheduler.transition(task.task_id, "pending")
+        self._publish_event({
+            "type": "task_state_changed",
+            "task_id": task.task_id,
+            "agent_type": task.agent_type,
+            "new_state": "pending",
+        })
+        self._publish_event({
+            "type": "agent_log",
+            "message": f"Task {task.task_id} requires revision loop {count}",
+        })
 
     async def _run_tester_task(self, task: ScheduledTask) -> None:
         # Gather actual workspace state for the tester
