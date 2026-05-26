@@ -123,29 +123,72 @@ class AgentExecutor:
 
     def _normalize_planner_output(self, data: dict[str, Any]) -> dict[str, Any]:
         """Normalize Planner output: fix field names, types, flatten structures."""
-        # Normalize tasks: map 'id' -> 'task_id' and ensure all required fields
-        for i, task in enumerate(data.get("tasks", [])):
+        # tasks may be a dict keyed by task_id — convert to list first
+        raw_tasks = data.get("tasks", [])
+        if isinstance(raw_tasks, dict):
+            raw_tasks = [{"task_id": k, **v} if isinstance(v, dict) else {"task_id": k, "description": str(v)} for k, v in raw_tasks.items()]
+            data["tasks"] = raw_tasks
+
+        normalized: list[dict[str, Any]] = []
+        for i, task in enumerate(raw_tasks):
+            # Coerce non-dict entries (strings, ints, etc.) into a minimal task dict
+            if not isinstance(task, dict):
+                task = {"description": str(task)}
+
+            # Map 'id' -> 'task_id'
             if "id" in task and "task_id" not in task:
                 task["task_id"] = task.pop("id")
+
+            # Ensure task_id exists
+            if "task_id" not in task:
+                task["task_id"] = f"task_{i + 1:03d}"
+
             # Ensure title exists
-            if "title" not in task and "description" in task:
-                task["title"] = task["description"][:50]
-            # Ensure agent_type exists
+            if "title" not in task:
+                task["title"] = task.get("description", f"Task {i + 1}")[:60]
+
+            # Ensure description exists
+            if "description" not in task:
+                task["description"] = task.get("title", f"Task {i + 1}")
+
+            # Ensure agent_type exists and is valid
             if "agent_type" not in task:
                 task["agent_type"] = "coder"
-        
-        # Flatten milestones if they're objects
-        if data.get("milestones") and isinstance(data["milestones"][0], dict):
-            data["milestones"] = [
-                m.get("title", str(m)) for m in data["milestones"]
-            ]
-        
-        # Flatten architecture_notes if it's a list
-        if data.get("architecture_notes") and isinstance(data["architecture_notes"], list):
-            data["architecture_notes"] = " ".join([
-                n.get("note", str(n)) for n in data["architecture_notes"]
-            ])
-        
+
+            # Ensure dependencies is a list
+            if "dependencies" not in task or not isinstance(task["dependencies"], list):
+                task["dependencies"] = []
+
+            # Ensure priority is an int
+            if "priority" not in task:
+                task["priority"] = 5
+            else:
+                try:
+                    task["priority"] = int(task["priority"])
+                except (ValueError, TypeError):
+                    task["priority"] = 5
+
+            normalized.append(task)
+
+        data["tasks"] = normalized
+
+        # Ensure milestones is a list of strings (not objects)
+        milestones = data.get("milestones", [])
+        if not isinstance(milestones, list):
+            milestones = [str(milestones)] if milestones else []
+        data["milestones"] = [
+            m.get("title", str(m)) if isinstance(m, dict) else str(m)
+            for m in milestones
+        ]
+
+        # Ensure architecture_notes is a string (not list or dict)
+        arch = data.get("architecture_notes", "")
+        if isinstance(arch, list):
+            arch = " ".join(item.get("note", str(item)) if isinstance(item, dict) else str(item) for item in arch)
+        elif isinstance(arch, dict):
+            arch = str(arch)
+        data["architecture_notes"] = arch or ""
+
         return data
 
     def _normalize_coder_output(self, data: dict[str, Any]) -> dict[str, Any]:
