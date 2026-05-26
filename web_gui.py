@@ -296,6 +296,58 @@ def create_app(state: AppState) -> FastAPI:
         }
 
     # -----------------------------------------------------------------------
+    # REST — file browser: list workspace files for a job
+    # -----------------------------------------------------------------------
+    @app.get("/api/jobs/{job_id}/files")
+    async def list_workspace_files(job_id: str) -> dict[str, Any]:
+        try:
+            with sqlite3.connect(state.db_path, timeout=2.0) as conn:
+                row = conn.execute(
+                    "SELECT workspace_path FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+        except sqlite3.Error:
+            return {"error": "DB error", "files": []}
+        if not row:
+            return {"error": "Job not found", "files": []}
+        ws_root = Path(row[0])
+        if not ws_root.exists():
+            return {"error": "Workspace not found", "files": []}
+        files = []
+        for p in sorted(ws_root.rglob("*")):
+            if p.is_file():
+                rel = str(p.relative_to(ws_root))
+                files.append({
+                    "path": rel,
+                    "size": p.stat().st_size,
+                    "is_source": p.suffix in (".py", ".js", ".ts", ".json", ".toml", ".md", ".txt", ".yaml", ".yml"),
+                })
+        return {"workspace": str(ws_root), "files": files}
+
+    @app.get("/api/jobs/{job_id}/files/{file_path:path}")
+    async def read_workspace_file(job_id: str, file_path: str) -> dict[str, Any]:
+        try:
+            with sqlite3.connect(state.db_path, timeout=2.0) as conn:
+                row = conn.execute(
+                    "SELECT workspace_path FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+        except sqlite3.Error:
+            return {"error": "DB error"}
+        if not row:
+            return {"error": "Job not found"}
+        ws_root = Path(row[0])
+        target = (ws_root / file_path).resolve()
+        # Path traversal guard
+        if ws_root.resolve() not in target.parents and target != ws_root.resolve():
+            return {"error": "Access denied"}
+        if not target.exists() or not target.is_file():
+            return {"error": "File not found"}
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return {"error": str(exc)}
+        return {"path": file_path, "content": content, "size": target.stat().st_size}
+
+    # -----------------------------------------------------------------------
     # Serve the single-page HTML UI
     # -----------------------------------------------------------------------
     @app.get("/", response_class=HTMLResponse)
@@ -396,6 +448,21 @@ _HTML = r"""<!DOCTYPE html>
   .speaker-system { color: var(--muted); }
   .speaker-error { color: var(--red); }
   footer { background: var(--surface); border-top: 1px solid var(--border); padding: 4px 16px; font-size: 11px; color: var(--muted); display: flex; gap: 16px; }
+  /* File browser */
+  .file-entry { display: flex; align-items: center; gap: 6px; padding: 3px 12px; cursor: pointer; font-size: 11px; font-family: monospace; border-bottom: 1px solid #1c2128; }
+  .file-entry:hover { background: #1c2128; }
+  .file-icon { color: var(--muted); flex-shrink: 0; }
+  .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-size { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+  /* File viewer modal */
+  #file-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
+  #file-modal.open { display: flex; }
+  #file-modal-inner { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; width: 80vw; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; }
+  #file-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  #file-modal-title { font-size: 12px; font-family: monospace; color: var(--accent); }
+  #file-modal-close { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; padding: 0 4px; }
+  #file-modal-close:hover { color: var(--text); }
+  #file-modal-content { overflow: auto; padding: 12px 16px; font-family: "SF Mono","Fira Code",monospace; font-size: 11px; line-height: 1.6; white-space: pre; flex: 1; }
 </style>
 </head>
 <body>
@@ -462,6 +529,11 @@ _HTML += r"""
       <span>ID</span><span>State</span><span>Goal</span><span>Time</span>
     </div>
     <div id="jobs-list"></div>
+
+    <div class="panel-title" style="margin-top:4px">File Browser</div>
+    <div id="file-browser" style="overflow-y:auto;flex:1;min-height:80px">
+      <div id="file-list" style="padding:4px 0"></div>
+    </div>
   </div>
 
   <!-- Right column -->
@@ -482,6 +554,16 @@ _HTML += r"""
   <span id="footer-status">Ready</span>
   <span id="footer-job">No active job</span>
 </footer>
+
+<div id="file-modal">
+  <div id="file-modal-inner">
+    <div id="file-modal-header">
+      <span id="file-modal-title"></span>
+      <button id="file-modal-close">✕</button>
+    </div>
+    <div id="file-modal-content"></div>
+  </div>
+</div>
 """
 _HTML += r"""
 <script>
@@ -515,7 +597,10 @@ function handleEvent(ev) {
   else if (t === "agent_log")      onAgentLog(ev);
   else if (t === "agent_output")   onAgentOutput(ev);
   else if (t === "task_state_changed") onTaskStateChanged(ev);
-  else if (t === "file_written")   appendLog(`File created: ${ev.path}`, "success");
+  else if (t === "file_written") {
+    appendLog(`File created: ${ev.path}`, "success");
+    if (state.selectedJobId) refreshFileBrowser(state.selectedJobId);
+  }
   else if (t === "validation_result") onValidation(ev);
   else if (t === "escalation_added")  appendLog(`⚠ ESCALATION: ${ev.escalation?.reason}`, "warning");
 }
@@ -530,6 +615,11 @@ function onJobStateChanged(ev) {
   appendLog(`Job ${s.toUpperCase()}`, "info");
   appendChat("System", `Job ${s}`, s === "failed" ? "error" : "system");
   refreshJobs();
+  // Auto-select the active job so the file browser tracks it
+  if (ev.job_id) {
+    state.selectedJobId = ev.job_id;
+    if (["completed","failed"].includes(s)) refreshFileBrowser(ev.job_id);
+  }
 }
 
 function onAgentLog(ev) {
@@ -618,7 +708,70 @@ async function selectJob(jobId) {
   state.tasks = {};
   for (const t of tasks) state.tasks[t.task_id] = { agent_type: t.agent_type, state: t.state };
   renderTasks();
+  refreshFileBrowser(jobId);
 }
+
+// ── File browser ───────────────────────────────────────────────────────────
+async function refreshFileBrowser(jobId) {
+  const el = document.getElementById("file-list");
+  el.innerHTML = '<div style="padding:4px 12px;color:var(--muted);font-size:11px">Loading…</div>';
+  const data = await fetch(`/api/jobs/${jobId}/files`).then(r => r.json()).catch(() => ({ files: [], error: "fetch failed" }));
+  el.innerHTML = "";
+  if (data.error && !data.files?.length) {
+    el.innerHTML = `<div style="padding:4px 12px;color:var(--muted);font-size:11px">${data.error}</div>`;
+    return;
+  }
+  // Group by directory
+  const byDir = {};
+  for (const f of (data.files || [])) {
+    const parts = f.path.split("/");
+    const dir = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+    if (!byDir[dir]) byDir[dir] = [];
+    byDir[dir].push(f);
+  }
+  for (const [dir, files] of Object.entries(byDir)) {
+    if (dir) {
+      const hdr = document.createElement("div");
+      hdr.style.cssText = "padding:3px 12px;font-size:10px;color:var(--muted);font-weight:600;background:#1c2128;";
+      hdr.textContent = "📁 " + dir;
+      el.appendChild(hdr);
+    }
+    for (const f of files) {
+      const row = document.createElement("div");
+      row.className = "file-entry";
+      const icon = f.is_source ? "📄" : "📦";
+      const name = f.path.split("/").pop();
+      const size = f.size < 1024 ? `${f.size}B` : `${(f.size/1024).toFixed(1)}K`;
+      row.innerHTML = `<span class="file-icon">${icon}</span><span class="file-name" title="${f.path}">${name}</span><span class="file-size">${size}</span>`;
+      if (f.is_source) {
+        row.onclick = () => openFile(jobId, f.path);
+      }
+      el.appendChild(row);
+    }
+  }
+  if (!data.files?.length) {
+    el.innerHTML = '<div style="padding:4px 12px;color:var(--muted);font-size:11px">No files yet</div>';
+  }
+}
+
+async function openFile(jobId, filePath) {
+  const modal = document.getElementById("file-modal");
+  const title = document.getElementById("file-modal-title");
+  const content = document.getElementById("file-modal-content");
+  title.textContent = filePath;
+  content.textContent = "Loading…";
+  modal.classList.add("open");
+  const data = await fetch(`/api/jobs/${jobId}/files/${filePath}`).then(r => r.json()).catch(() => ({ error: "fetch failed" }));
+  content.textContent = data.error ? `Error: ${data.error}` : (data.content || "(empty)");
+}
+
+document.getElementById("file-modal-close").onclick = () => {
+  document.getElementById("file-modal").classList.remove("open");
+};
+document.getElementById("file-modal").onclick = (e) => {
+  if (e.target === document.getElementById("file-modal"))
+    document.getElementById("file-modal").classList.remove("open");
+};
 
 // ── Log helpers ────────────────────────────────────────────────────────────
 function appendLog(msg, cls = "debug") {

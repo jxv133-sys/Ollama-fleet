@@ -803,6 +803,27 @@ class Orchestrator:
                     },
                 }
             )
+            # ----------------------------------------------------------------
+            # Agent collaboration: if the synthesizer identified next_steps,
+            # run a refiner pass where those suggestions are fed back to the
+            # coder for a final improvement round.
+            # ----------------------------------------------------------------
+            if synthesizer_output.next_steps and job is not None:
+                try:
+                    await self._run_refiner_pass(
+                        job_id=task.job_id,
+                        goal=goal,
+                        next_steps=synthesizer_output.next_steps,
+                        workspace_manager=WorkspaceManager(job.workspace_path),
+                    )
+                except Exception as exc:
+                    logger.warning("Refiner pass failed (non-fatal): %s", exc)
+                    self._publish_event({
+                        "type": "agent_log",
+                        "message": f"Refiner pass skipped: {exc}",
+                        "level": "warning",
+                    })
+
         await self.scheduler.transition(task.task_id, "completed")
         self._publish_event(
             {
@@ -812,6 +833,142 @@ class Orchestrator:
                 "new_state": "completed",
             }
         )
+
+    async def _run_refiner_pass(
+        self,
+        job_id: str,
+        goal: str,
+        next_steps: list[str],
+        workspace_manager: WorkspaceManager,
+    ) -> None:
+        """Agent collaboration: synthesizer → coder improvement loop.
+
+        The synthesizer's next_steps are fed back to the coder as a targeted
+        refinement prompt. The coder produces improvements, the critic reviews
+        them, and the results are written back to the workspace. This is a
+        single best-effort pass — failures are logged but never propagate.
+        """
+        self._publish_event({
+            "type": "agent_log",
+            "message": f"[REFINER] Starting agent collaboration pass with {len(next_steps)} improvement suggestions.",
+            "level": "info",
+        })
+
+        # Collect all current source files for context
+        src_files = [
+            str(p.relative_to(workspace_manager.root))
+            for p in workspace_manager.root.rglob("*.py")
+            if p.is_file() and "agent_outputs" not in str(p)
+        ]
+        file_contents = {
+            path: (workspace_manager.root / path).read_text(encoding="utf-8")
+            for path in src_files
+            if (workspace_manager.root / path).exists()
+        }
+
+        improvement_description = (
+            f"Improve the existing codebase for goal: {goal}\n\n"
+            "The synthesizer agent reviewed the completed code and identified these improvements:\n"
+            + "\n".join(f"- {step}" for step in next_steps[:5])
+            + "\n\nApply these improvements to the existing files. "
+            "Only modify files that need changes. Keep working code intact."
+        )
+
+        self._publish_event({
+            "type": "agent_log",
+            "message": "[REFINER] Coder agent applying synthesizer suggestions…",
+            "level": "info",
+        })
+
+        refiner_output = await self.executor.execute(
+            {
+                "task_id": f"{job_id}:refiner",
+                "goal": goal,
+                "description": improvement_description,
+            },
+            AgentType.CODER,
+            extra_context={
+                "active_files": src_files,
+                "episodic_summaries": [f"Improvement suggestions: {'; '.join(next_steps[:3])}"],
+                "critic_issues": [],
+            },
+        )
+
+        if not isinstance(refiner_output, CoderOutput) or not refiner_output.file_modifications:
+            self._publish_event({
+                "type": "agent_log",
+                "message": "[REFINER] No modifications produced — skipping.",
+                "level": "info",
+            })
+            return
+
+        # Write refined files
+        modified_files: list[str] = []
+        for change in refiner_output.file_modifications:
+            raw = Path(change.file_path)
+            if raw.is_absolute():
+                raw = raw.relative_to(raw.anchor)
+            rel_path = str(raw)
+            workspace_manager.write_file(change.file_path, change.content)
+            modified_files.append(rel_path)
+            self._publish_event({
+                "type": "file_written",
+                "path": rel_path,
+                "job_id": job_id,
+            })
+
+        self._publish_event({
+            "type": "agent_log",
+            "message": f"[REFINER] Coder updated {len(modified_files)} file(s): {', '.join(modified_files)}",
+            "level": "info",
+        })
+
+        # Quick critic review of the refined output
+        validation_result = self.validation.validate(modified_files, workspace_manager)
+        if not validation_result.syntax_ok:
+            self._publish_event({
+                "type": "agent_log",
+                "message": "[REFINER] Refined output has syntax errors — reverting is not automatic, check workspace.",
+                "level": "warning",
+            })
+            return
+
+        critic_output = await self.executor.execute(
+            {
+                "task_id": f"{job_id}:refiner_critic",
+                "goal": goal,
+                "description": improvement_description,
+            },
+            AgentType.CRITIC,
+            extra_context={
+                "modified_files": modified_files,
+                "file_contents": {
+                    path: (workspace_manager.root / path).read_text(encoding="utf-8")
+                    for path in modified_files
+                },
+                "lint_results": [vars(i) for i in validation_result.lint_results],
+                "critic_issues": [],
+            },
+        )
+
+        approved = isinstance(critic_output, CriticOutput) and critic_output.approved
+        self._publish_event({
+            "type": "agent_output",
+            "agent_type": "refiner",
+            "output": {
+                "files_improved": modified_files,
+                "critic_approved": approved,
+                "summary": refiner_output.summary,
+            },
+        })
+        self._publish_event({
+            "type": "agent_log",
+            "message": (
+                f"[REFINER] Complete — critic {'approved' if approved else 'flagged'} refined output. "
+                f"Files: {', '.join(modified_files)}"
+            ),
+            "level": "info" if approved else "warning",
+        })
 
     async def _check_stall(self) -> None:
         """Background coroutine: detect stalled jobs and escalate them.
