@@ -178,6 +178,49 @@ class AgentExecutor:
         
         return data
 
+    def _normalize_synthesizer_output(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize Synthesizer output: coerce common model shape drift."""
+        key_aliases = {
+            "changes": "changelog",
+            "change_log": "changelog",
+            "files": "files_produced",
+            "produced_files": "files_produced",
+            "nextSteps": "next_steps",
+            "nextStep": "next_steps",
+            "next_step": "next_steps",
+            "recommendations": "next_steps",
+        }
+        for old_key, new_key in key_aliases.items():
+            if old_key in data and new_key not in data:
+                data[new_key] = data.pop(old_key)
+
+        if "next_steps" not in data:
+            step_items = [
+                value
+                for key, value in sorted(data.items())
+                if isinstance(key, str) and key.lower().startswith("step ")
+            ]
+            if step_items:
+                data["next_steps"] = step_items
+
+        for key in ("changelog", "files_produced", "next_steps"):
+            value = data.get(key, [])
+            if isinstance(value, list):
+                data[key] = [str(item) for item in value if item is not None]
+            elif value is None:
+                data[key] = []
+            elif isinstance(value, dict):
+                data[key] = [str(item) for item in value.values() if item is not None]
+            else:
+                data[key] = [str(value)]
+
+        if "summary" not in data or data["summary"] is None:
+            data["summary"] = ""
+        else:
+            data["summary"] = str(data["summary"])
+
+        return data
+
     def _parse_output(self, raw: str, agent_type: AgentType) -> AgentOutput:
         raw = raw.strip()
         if not raw:
@@ -215,6 +258,7 @@ class AgentExecutor:
             body = self._normalize_critic_output(body)
             return CriticOutput.model_validate(body)
         if agent_type == AgentType.SYNTHESIZER:
+            body = self._normalize_synthesizer_output(body)
             return SynthesizerOutput.model_validate(body)
         raise ValueError(f"Unsupported agent type: {agent_type}")
 

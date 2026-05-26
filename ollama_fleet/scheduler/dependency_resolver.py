@@ -30,7 +30,8 @@ class DependencyResolver:
                     (dependency_id,),
                 )
                 if dep is None:
-                    continue
+                    failed_dependency = dependency_id
+                    break
                 dep_state = dep[0]
                 dep_states.append(dep_state)
                 if dep_state in ("failed", "cancelled"):
@@ -46,7 +47,7 @@ class DependencyResolver:
                     WHERE task_id = ? AND state = 'blocked'
                     """,
                     (
-                        f"dependency {failed_dependency} failed or cancelled",
+                        f"dependency {failed_dependency} missing, failed, or cancelled",
                         datetime.now(timezone.utc).isoformat(),
                         task_id,
                     ),

@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import queue
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -22,6 +24,8 @@ from pathlib import Path
 from typing import Any
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from ollama_fleet.config import load_settings
 from ollama_fleet.db.database import Database
@@ -42,17 +46,33 @@ class TkEventBus:
 
 
 class FleetTkApp(tk.Tk):
-    def __init__(self, event_queue: "queue.Queue[dict[str, Any]]", goal: str = "Demo GUI", use_demo: bool = False) -> None:
+    def __init__(
+        self,
+        event_queue: "queue.Queue[dict[str, Any]]",
+        goal: str = "Demo GUI",
+        use_demo: bool = False,
+        db_path: str | Path = "ollama_fleet.db",
+    ) -> None:
         super().__init__()
         self.title("Ollama Fleet - Multi-Agent Orchestration")
         self.geometry("1400x900")
         self.event_queue = event_queue
         self.goal = goal
         self.use_demo = use_demo
+        self.db_path = Path(db_path)
         self.start_time: float | None = None
         self.elapsed_var = tk.StringVar(value="0s")
+        self.jobs_by_id: dict[str, dict[str, str]] = {}
+        self.initial_settings = load_settings()
+        self.model_vars: dict[str, tk.StringVar] = {}
+        self.model_menus: dict[str, tk.OptionMenu] = {}
+        self.default_model_ids = self._default_model_ids()
+        self._selected_models: dict[str, str] = {}
+        self._selected_base_url = self.initial_settings.ollama.base_url
         
         self._build_ui()
+        self._refresh_jobs_from_db()
+        self.after(250, self._fetch_models_async)
         self._poll()
 
     def _build_ui(self) -> None:
@@ -78,6 +98,8 @@ class FleetTkApp(tk.Tk):
         self.start_btn.pack(side=tk.LEFT, padx=2)
         self.stop_btn = ttk.Button(button_frame, text="⏹ Stop", command=self._on_stop, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=2)
+
+        self._build_model_selection_section(header)
         
         # ========== Main Content ==========
         main_container = ttk.Frame(self)
@@ -88,14 +110,19 @@ class FleetTkApp(tk.Tk):
         # Left panel (Job info, Agents, Files)
         left_panel = ttk.Frame(main_container, relief=tk.RIDGE, borderwidth=2)
         left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        left_panel.grid_rowconfigure(1, weight=1)
         left_panel.grid_rowconfigure(3, weight=1)
+        left_panel.grid_rowconfigure(5, weight=1)
         left_panel.grid_columnconfigure(0, weight=1)
         
-        # Job Info Section
-        self._build_job_info_section(left_panel)
+        # AI Chat Section
+        self._build_ai_chat_section(left_panel)
         
         # Agents Section
         self._build_agents_section(left_panel)
+
+        # Jobs Section
+        self._build_jobs_section(left_panel)
         
         # Right panel (Progress & Output)
         right_panel = ttk.Frame(main_container, relief=tk.RIDGE, borderwidth=2)
@@ -129,27 +156,75 @@ class FleetTkApp(tk.Tk):
         if self.goal != "Demo GUI" or self.use_demo:
             self.after(100, self._on_start)
 
-    def _build_job_info_section(self, parent: ttk.Frame) -> None:
-        """Build the job information display section."""
-        ttk.Label(parent, text="Job Information", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
-        
-        info_frame = ttk.Frame(parent, relief=tk.FLAT, borderwidth=1)
-        info_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=2)
-        info_frame.grid_columnconfigure(1, weight=1)
-        
-        ttk.Label(info_frame, text="ID:", font=("TkDefaultFont", 9)).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+    def _build_model_selection_section(self, parent: ttk.Frame) -> None:
+        """Build per-agent model selection controls."""
+        models_frame = ttk.Frame(parent)
+        models_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 4))
+        models_frame.grid_columnconfigure(1, weight=1)
+        models_frame.grid_columnconfigure(3, weight=1)
+        models_frame.grid_columnconfigure(5, weight=1)
+
+        ttk.Label(models_frame, text="Models:", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self.models_url_var = tk.StringVar(value=self.initial_settings.ollama.base_url)
+        ttk.Entry(models_frame, textvariable=self.models_url_var, width=32).grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Button(models_frame, text="Load Models", command=self._fetch_models_async).grid(row=0, column=2, sticky="w", padx=2)
+        self.models_status_var = tk.StringVar(value="Models not loaded")
+        ttk.Label(models_frame, textvariable=self.models_status_var, font=("TkDefaultFont", 9)).grid(row=0, column=3, sticky="w", padx=6)
+
+        defaults = {
+            "planner": self.initial_settings.ollama.planner_model,
+            "coder": self.initial_settings.ollama.coder_model,
+            "critic": self.initial_settings.ollama.critic_model or self.initial_settings.ollama.coder_model,
+            "tester": self.initial_settings.ollama.tester_model or self.initial_settings.ollama.coder_model,
+            "synthesizer": self.initial_settings.ollama.summarizer_model,
+        }
+        labels = {
+            "planner": "All-around",
+            "coder": "Coding",
+            "critic": "Critic",
+            "tester": "Testing",
+            "synthesizer": "Summary",
+        }
+        positions = {
+            "planner": (1, 0),
+            "coder": (1, 2),
+            "critic": (1, 4),
+            "tester": (2, 0),
+            "synthesizer": (2, 2),
+        }
+        for key in ("planner", "coder", "critic", "tester", "synthesizer"):
+            row, column = positions[key]
+            ttk.Label(models_frame, text=f"{labels[key]}:").grid(row=row, column=column, sticky="w", padx=(0, 2), pady=(4, 0))
+            var = tk.StringVar(value=defaults[key])
+            menu = tk.OptionMenu(models_frame, var, *self.default_model_ids)
+            menu.config(width=34, anchor="w")
+            menu.grid(row=row, column=column + 1, sticky="ew", padx=(0, 8), pady=(4, 0))
+            self.model_vars[key] = var
+            self.model_menus[key] = menu
+
+    def _build_ai_chat_section(self, parent: ttk.Frame) -> None:
+        """Build the AI conversation display section."""
+        ttk.Label(parent, text="AI Chat", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+
         self.job_id_var = tk.StringVar(value="–")
-        ttk.Label(info_frame, textvariable=self.job_id_var, font=("TkDefaultFont", 9, "bold"), foreground="blue").grid(row=0, column=1, sticky="ew", padx=4, pady=2)
-        
-        ttk.Label(info_frame, text="State:", font=("TkDefaultFont", 9)).grid(row=1, column=0, sticky="w", padx=4, pady=2)
         self.job_state_var = tk.StringVar(value="idle")
-        self.job_state_label = ttk.Label(info_frame, textvariable=self.job_state_var, font=("TkDefaultFont", 9, "bold"), foreground="orange")
-        self.job_state_label.grid(row=1, column=1, sticky="ew", padx=4, pady=2)
-        
-        ttk.Label(info_frame, text="Goal:", font=("TkDefaultFont", 9)).grid(row=2, column=0, sticky="nw", padx=4, pady=2)
         self.job_goal_var = tk.StringVar(value="–")
-        goal_label = ttk.Label(info_frame, textvariable=self.job_goal_var, font=("TkDefaultFont", 9), wraplength=300, justify=tk.LEFT)
-        goal_label.grid(row=2, column=1, sticky="ew", padx=4, pady=2)
+
+        self.ai_chat = scrolledtext.ScrolledText(
+            parent,
+            height=8,
+            font=("TkDefaultFont", 9),
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+        )
+        self.ai_chat.grid(row=1, column=0, sticky="nsew", padx=4, pady=2)
+        self.ai_chat.tag_config("planner", foreground="#0066CC")
+        self.ai_chat.tag_config("coder", foreground="#00AA00")
+        self.ai_chat.tag_config("critic", foreground="#CC6600")
+        self.ai_chat.tag_config("tester", foreground="#AA0000")
+        self.ai_chat.tag_config("synthesizer", foreground="#6600CC")
+        self.ai_chat.tag_config("system", foreground="gray")
+        self.ai_chat.tag_config("error", foreground="red")
 
     def _build_agents_section(self, parent: ttk.Frame) -> None:
         """Build the agent status section."""
@@ -187,6 +262,36 @@ class FleetTkApp(tk.Tk):
             canvas.configure(scrollregion=canvas.bbox("all"))
         
         self.agents_frame.bind("<Configure>", lambda e: on_agents_frame_configure())
+
+    def _build_jobs_section(self, parent: ttk.Frame) -> None:
+        """Build the persisted jobs list."""
+        ttk.Label(parent, text="Jobs", font=("TkDefaultFont", 11, "bold")).grid(row=4, column=0, sticky="w", padx=4, pady=(8, 2))
+
+        jobs_container = ttk.Frame(parent, relief=tk.FLAT, borderwidth=1)
+        jobs_container.grid(row=5, column=0, sticky="nsew", padx=4, pady=2)
+        jobs_container.grid_rowconfigure(0, weight=1)
+        jobs_container.grid_columnconfigure(0, weight=1)
+
+        self.jobs_tree = ttk.Treeview(
+            jobs_container,
+            columns=("id", "state", "goal", "updated"),
+            height=8,
+            show="headings",
+        )
+        self.jobs_tree.heading("id", text="ID")
+        self.jobs_tree.heading("state", text="State")
+        self.jobs_tree.heading("goal", text="Goal")
+        self.jobs_tree.heading("updated", text="Updated")
+        self.jobs_tree.column("id", width=95, anchor="w")
+        self.jobs_tree.column("state", width=80, anchor="center")
+        self.jobs_tree.column("goal", width=230, anchor="w")
+        self.jobs_tree.column("updated", width=85, anchor="w")
+        self.jobs_tree.grid(row=0, column=0, sticky="nsew")
+
+        jobs_scroll = ttk.Scrollbar(jobs_container, orient=tk.VERTICAL, command=self.jobs_tree.yview)
+        jobs_scroll.grid(row=0, column=1, sticky="ns")
+        self.jobs_tree.configure(yscrollcommand=jobs_scroll.set)
+        self.jobs_tree.bind("<<TreeviewSelect>>", self._on_job_selected)
 
     def _build_progress_section(self, parent: ttk.Frame) -> None:
         """Build the task progress section."""
@@ -229,11 +334,148 @@ class FleetTkApp(tk.Tk):
         self.raw_output.tag_config("tester", foreground="#AA0000")
         self.raw_output.tag_config("synthesizer", foreground="#6600CC")
 
+    def _default_model_ids(self) -> list[str]:
+        """Return unique configured model IDs for initial dropdown values."""
+        models = [
+            self.initial_settings.ollama.planner_model,
+            self.initial_settings.ollama.coder_model,
+            self.initial_settings.ollama.critic_model,
+            self.initial_settings.ollama.tester_model,
+            self.initial_settings.ollama.summarizer_model,
+        ]
+        return sorted({model for model in models if model})
+
+    def _fetch_models_async(self) -> None:
+        """Fetch model IDs without blocking the Tk mainloop."""
+        self.models_status_var.set("Loading models...")
+        base_url = self.models_url_var.get().strip()
+        thread = threading.Thread(target=self._fetch_models_worker, args=(base_url,), daemon=True)
+        thread.start()
+
+    def _fetch_models_worker(self, base_url: str) -> None:
+        try:
+            model_ids = self._request_model_ids(base_url)
+        except Exception as exc:
+            self.event_queue.put_nowait(
+                {
+                    "type": "models_load_failed",
+                    "message": str(exc),
+                }
+            )
+            return
+
+        self.event_queue.put_nowait(
+            {
+                "type": "models_loaded",
+                "models": model_ids,
+            }
+        )
+
+    @staticmethod
+    def _request_model_ids(base_url: str) -> list[str]:
+        """Request model IDs from an OpenAI-compatible /v1/models endpoint."""
+        if not base_url:
+            raise ValueError("Model server URL is empty")
+
+        clean_url = base_url.rstrip("/")
+        if clean_url.endswith("/v1/models"):
+            endpoint = clean_url
+        else:
+            endpoint = f"{clean_url}/v1/models"
+
+        request = Request(endpoint, headers={"Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=10.0) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Model request failed with HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not connect to model server: {exc.reason}") from exc
+
+        payload = json.loads(raw)
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            model_ids = [
+                str(item["id"])
+                for item in payload["data"]
+                if isinstance(item, dict) and item.get("id")
+            ]
+        elif isinstance(payload, dict) and isinstance(payload.get("models"), list):
+            model_ids = [
+                str(item.get("name") or item.get("id"))
+                for item in payload["models"]
+                if isinstance(item, dict) and (item.get("name") or item.get("id"))
+            ]
+        elif isinstance(payload, list):
+            model_ids = [
+                str(item.get("id") or item.get("name") if isinstance(item, dict) else item)
+                for item in payload
+            ]
+        else:
+            raise ValueError("Model server returned an unrecognized model list format")
+
+        unique_ids = sorted({model_id for model_id in model_ids if model_id})
+        if not unique_ids:
+            raise ValueError("Model server returned no models")
+        return unique_ids
+
+    def _handle_models_loaded(self, event: dict[str, Any]) -> None:
+        models = event.get("models", [])
+        if not isinstance(models, list):
+            models = []
+        values = tuple(sorted({*self.default_model_ids, *(str(model) for model in models)}))
+        self._update_model_menus(values)
+        self.models_status_var.set(f"{len(models)} models loaded")
+        self._append_output(f"Loaded {len(models)} models from {self.models_url_var.get().strip()}/v1/models", "info")
+
+    def _handle_models_load_failed(self, event: dict[str, Any]) -> None:
+        message = event.get("message", "unknown error")
+        self._update_model_menus(tuple(self.default_model_ids))
+        self.models_status_var.set("Model load failed")
+        self._append_output(f"Could not load models: {message}", "warning")
+
+    def _update_model_menus(self, values: tuple[str, ...]) -> None:
+        """Replace OptionMenu choices while preserving current selections."""
+        for key, menu_button in self.model_menus.items():
+            variable = self.model_vars[key]
+            current_value = variable.get()
+            choices = values
+            if current_value and current_value not in choices:
+                choices = tuple(sorted({*choices, current_value}))
+            menu = menu_button["menu"]
+            menu.delete(0, "end")
+            for choice in choices:
+                menu.add_command(label=choice, command=tk._setit(variable, choice))
+
+    def _apply_selected_models(self, settings: Any) -> None:
+        """Apply GUI model choices to runtime settings."""
+        selected = self._selected_models
+        if selected.get("planner"):
+            settings.ollama.planner_model = selected["planner"]
+        if selected.get("coder"):
+            settings.ollama.coder_model = selected["coder"]
+        if selected.get("critic"):
+            settings.ollama.critic_model = selected["critic"]
+        if selected.get("tester"):
+            settings.ollama.tester_model = selected["tester"]
+        if selected.get("synthesizer"):
+            settings.ollama.summarizer_model = selected["synthesizer"]
+
+        base_url = self._selected_base_url
+        if base_url:
+            settings.ollama.base_url = base_url.removesuffix("/v1/models").rstrip("/")
+
     def _on_start(self) -> None:
         if self._job_running:
             messagebox.showinfo("Info", "Job already running")
             return
         goal = self.goal_var.get().strip() or "Demo GUI"
+        self._selected_models = {
+            key: var.get().strip()
+            for key, var in self.model_vars.items()
+            if var.get().strip()
+        }
+        self._selected_base_url = self.models_url_var.get().strip()
         self._orchestrator_stop.clear()
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -243,7 +485,10 @@ class FleetTkApp(tk.Tk):
         # Display goal immediately
         self.job_goal_var.set(goal)
         self.job_state_var.set("submitted")
-        self.job_state_label.config(foreground="orange")
+        self.ai_chat.configure(state=tk.NORMAL)
+        self.ai_chat.delete("1.0", tk.END)
+        self.ai_chat.configure(state=tk.DISABLED)
+        self._append_chat("System", f"New job submitted: {goal}", "system")
         
         # Clear agents status
         for agent_name in self.agents_vars:
@@ -268,7 +513,8 @@ class FleetTkApp(tk.Tk):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         settings = load_settings()
-        db = Database(Path("ollama_fleet.db"))
+        self._apply_selected_models(settings)
+        db = Database(self.db_path)
 
         async def run_orch() -> None:
             await db.connect()
@@ -307,10 +553,11 @@ class FleetTkApp(tk.Tk):
                 })
                 
                 job_id = await orch.submit_job(goal=goal, config={"source": "gui_tk"})
-                
+                job = await orch.job_manager.get_job(job_id)
+                final_state = job.state if job is not None else "finished"
                 self.event_queue.put_nowait({
                     "type": "agent_log",
-                    "message": f"Job submitted successfully: {job_id}",
+                    "message": f"Job {final_state}: {job_id}",
                     "level": "info"
                 })
             except Exception as e:
@@ -324,6 +571,11 @@ class FleetTkApp(tk.Tk):
                     "type": "agent_log",
                     "message": traceback.format_exc(),
                     "level": "error"
+                })
+                self.event_queue.put_nowait({
+                    "type": "job_state_changed",
+                    "job_id": "",
+                    "new_state": "failed"
                 })
             finally:
                 await db.close()
@@ -348,15 +600,6 @@ class FleetTkApp(tk.Tk):
         finally:
             try:
                 loop.close()
-            except Exception:
-                pass
-            # Signal job completion
-            try:
-                self.event_queue.put_nowait({
-                    "type": "job_state_changed",
-                    "job_id": "",
-                    "new_state": "completed"
-                })
             except Exception:
                 pass
 
@@ -405,6 +648,93 @@ class FleetTkApp(tk.Tk):
             self._handle_validation_result(event)
         elif event_type == "escalation_added":
             self._handle_escalation_added(event)
+        elif event_type == "models_loaded":
+            self._handle_models_loaded(event)
+        elif event_type == "models_load_failed":
+            self._handle_models_load_failed(event)
+
+    def _refresh_jobs_from_db(self) -> None:
+        """Load persisted jobs into the jobs table."""
+        try:
+            with sqlite3.connect(self.db_path, timeout=2.0) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT job_id, goal, state, created_at, updated_at
+                    FROM jobs
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 100
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            return
+
+        seen_job_ids: set[str] = set()
+        for job_id, goal, state, created_at, updated_at in rows:
+            seen_job_ids.add(job_id)
+            updated_display = self._format_db_timestamp(updated_at or created_at)
+            self.jobs_by_id[job_id] = {
+                "job_id": job_id,
+                "goal": goal or "",
+                "state": state or "",
+                "created_at": created_at or "",
+                "updated_at": updated_at or "",
+            }
+            values = (job_id[:8], state, goal, updated_display)
+            if self.jobs_tree.exists(job_id):
+                self.jobs_tree.item(job_id, values=values)
+            else:
+                self.jobs_tree.insert("", tk.END, iid=job_id, values=values)
+
+        for child in self.jobs_tree.get_children():
+            if child not in seen_job_ids:
+                self.jobs_tree.delete(child)
+
+    def _load_tasks_for_job(self, job_id: str) -> None:
+        """Load persisted tasks for the selected job."""
+        try:
+            with sqlite3.connect(self.db_path, timeout=2.0) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT task_id, agent_type, state
+                    FROM tasks
+                    WHERE job_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (job_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            self._append_output(f"Could not load tasks for job {job_id[:8]}: {exc}", "warning")
+            return
+
+        for child in self.tasks_tree.get_children():
+            self.tasks_tree.delete(child)
+        for task_id, agent_type, state in rows:
+            self.tasks_tree.insert("", tk.END, iid=task_id, text=task_id, values=(agent_type, state, "–"))
+
+    def _on_job_selected(self, _event: tk.Event) -> None:
+        selected = self.jobs_tree.selection()
+        if not selected:
+            return
+        job_id = selected[0]
+        job = self.jobs_by_id.get(job_id)
+        if job is None:
+            return
+
+        self.job_id_var.set(job_id[:12])
+        self.job_state_var.set(job["state"])
+        self.job_goal_var.set(job["goal"])
+        self.status_var.set(f"Selected job {job_id[:8]} ({job['state']})")
+        self._load_tasks_for_job(job_id)
+
+    @staticmethod
+    def _format_db_timestamp(value: str) -> str:
+        if not value:
+            return "–"
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return value[:16]
+        return parsed.strftime("%H:%M:%S")
 
     def _handle_job_state_changed(self, event: dict[str, Any]) -> None:
         """Handle job state change event."""
@@ -419,16 +749,6 @@ class FleetTkApp(tk.Tk):
         if goal:
             self.job_goal_var.set(goal)
         
-        # Update label color based on state
-        state_colors = {
-            "idle": "gray",
-            "running": "orange",
-            "completed": "green",
-            "failed": "red",
-            "stopped": "gray"
-        }
-        self.job_state_label.config(foreground=state_colors.get(new_state, "black"))
-        
         if new_state in ("completed", "failed", "stopped"):
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
@@ -438,8 +758,14 @@ class FleetTkApp(tk.Tk):
         else:
             self.status_var.set(f"Job {new_state}")
         
+        self._refresh_jobs_from_db()
+        if job_id and self.jobs_tree.exists(job_id):
+            self.jobs_tree.selection_set(job_id)
+            self.jobs_tree.see(job_id)
+
         # Log the state change
         self._append_output(f"Job {new_state.upper()}", "info")
+        self._append_chat("System", f"Job {new_state}", "system" if new_state != "failed" else "error")
 
     def _handle_agent_log(self, event: dict[str, Any]) -> None:
         """Handle agent log message."""
@@ -454,6 +780,7 @@ class FleetTkApp(tk.Tk):
             self.agents_vars["planner"].set("✓ Completed")
             self.agents_labels["planner"].config(foreground="green")
             self._append_output("Planner agent completed", "info")
+            self._append_chat("Planner", msg, "planner")
 
     def _handle_agent_output(self, event: dict[str, Any]) -> None:
         """Handle agent output."""
@@ -463,6 +790,7 @@ class FleetTkApp(tk.Tk):
         # Format: [AGENT] output with agent-specific color
         msg = f"[{agent_type.upper()}] {output}"
         self._append_output(msg, agent_type)
+        self._append_chat(agent_type.title(), self._format_agent_message(output), agent_type)
         
         # Update agent status for agents with output
         if agent_type in self.agents_labels:
@@ -488,6 +816,9 @@ class FleetTkApp(tk.Tk):
             elif new_state == "failed":
                 self.agents_vars[agent_type].set(f"✗ Failed")
                 self.agents_labels[agent_type].config(foreground="red")
+                reason = event.get("reason")
+                if reason:
+                    self._append_chat(agent_type.title(), f"Failed: {reason}", "error")
         
         # Check if task already exists
         found = False
@@ -522,6 +853,34 @@ class FleetTkApp(tk.Tk):
         reason = esc.get("reason", "unknown")
         self._append_output(f"⚠ ESCALATION: {reason}", "warning")
 
+    def _append_chat(self, speaker: str, msg: str, tag: str = "system") -> None:
+        """Append one message to the AI chat panel."""
+        if not msg:
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.ai_chat.configure(state=tk.NORMAL)
+        self.ai_chat.insert(tk.END, f"[{timestamp}] {speaker}: ", tag)
+        self.ai_chat.insert(tk.END, f"{msg}\n\n", tag)
+        self.ai_chat.configure(state=tk.DISABLED)
+        self.ai_chat.see(tk.END)
+
+    @staticmethod
+    def _format_agent_message(output: Any) -> str:
+        """Convert agent output dictionaries into compact chat text."""
+        if isinstance(output, dict):
+            if "summary" in output:
+                pieces = [str(output["summary"])]
+                files = output.get("files_produced")
+                if files:
+                    pieces.append("Files: " + ", ".join(str(file) for file in files))
+                return "\n".join(pieces)
+            if "tasks_created" in output:
+                milestones = output.get("milestones") or []
+                return f"Created {output['tasks_created']} tasks. Milestones: {', '.join(map(str, milestones[:5]))}"
+            if "summary" in output:
+                return str(output["summary"])
+        return str(output)
+
     def _append_output(self, msg: str, tag: str = "debug") -> None:
         """Append message to output log with optional tag."""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -540,7 +899,7 @@ def main() -> int:
     args = parser.parse_args()
 
     q: "queue.Queue[dict[str, Any]]" = queue.Queue()
-    app = FleetTkApp(q, goal=args.goal, use_demo=args.demo)
+    app = FleetTkApp(q, goal=args.goal, use_demo=args.demo, db_path=args.db_path)
     app.mainloop()
     return 0
 

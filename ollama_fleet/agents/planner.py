@@ -21,6 +21,8 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
         "\nRESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.\n"
         "\nJSON SCHEMA REQUIREMENTS:\n"
         "- tasks: array of objects, EACH with: task_id (string), title (string), description (string), agent_type (string: 'coder'|'tester'|'synthesizer'), dependencies (array of strings), priority (integer 1-10)\n"
+        "- For goals that ask to build, make, create, implement, fix, or modify software, include at least one coder task that writes or changes files.\n"
+        "- Do not use a synthesizer task as the first or only task for build goals. Synthesizer tasks summarize completed work and must depend on coder/tester tasks.\n"
         "- milestones: array of STRINGS only (not objects)\n"
         "- architecture_notes: single STRING (not array, not object)\n"
         "\nEXAMPLE OUTPUT:\n"

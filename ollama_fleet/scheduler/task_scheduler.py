@@ -100,7 +100,8 @@ class TaskScheduler:
                     (dependency_id,),
                 )
                 if dep is None:
-                    continue
+                    failed_dependency = dependency_id
+                    break
                 dep_state = dep[0]
                 dep_states.append(dep_state)
                 if dep_state in ("failed", "cancelled"):
@@ -117,7 +118,7 @@ class TaskScheduler:
                     WHERE task_id = ? AND state = 'blocked'
                     """,
                     (
-                        f"dependency {failed_dependency} failed or cancelled",
+                        f"dependency {failed_dependency} missing, failed, or cancelled",
                         now,
                         task_id,
                     ),
@@ -224,6 +225,20 @@ class TaskScheduler:
         row = await self._db.fetchone(
             "SELECT COUNT(*) FROM tasks WHERE job_id = ? AND state IN ('pending', 'running')",
             (job_id,),
+        )
+        return int(row[0]) if row is not None else 0
+
+    async def count_failed_tasks(self, job_id: str) -> int:
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) FROM tasks WHERE job_id = ? AND state = 'failed'",
+            (job_id,),
+        )
+        return int(row[0]) if row is not None else 0
+
+    async def count_completed_tasks_by_agent(self, job_id: str, agent_type: str) -> int:
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) FROM tasks WHERE job_id = ? AND agent_type = ? AND state = 'completed'",
+            (job_id, agent_type),
         )
         return int(row[0]) if row is not None else 0
 

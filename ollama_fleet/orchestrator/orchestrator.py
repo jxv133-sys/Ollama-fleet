@@ -148,14 +148,14 @@ class Orchestrator:
             "architecture_notes": planner_output.architecture_notes,
             "tasks": [
                 {
-                    "task_id": t.task_id,
-                    "title": t.title,
-                    "description": t.description,
-                    "agent_type": t.agent_type,
-                    "dependencies": t.dependencies,
-                    "priority": t.priority,
+                    "task_id": task["task_id"],
+                    "title": task["title"],
+                    "description": task["description"],
+                    "agent_type": task["agent_type"],
+                    "dependencies": task["dependencies"],
+                    "priority": task["priority"],
                 }
-                for t in planner_output.tasks
+                for task in tasks
             ],
         }
         planner_count = len(list(workspace_manager.root.glob("agent_outputs/planner_*.json"))) + 1
@@ -183,12 +183,32 @@ class Orchestrator:
             if not ready_tasks:
                 active = await self.scheduler.count_active_tasks(job_id)
                 if active == 0:
-                    await self.job_manager.update_job_state(job_id, "completed")
+                    failed = await self.scheduler.count_failed_tasks(job_id)
+                    completed_coder_tasks = await self.scheduler.count_completed_tasks_by_agent(
+                        job_id,
+                        AgentType.CODER.value,
+                    )
+                    final_state = "failed" if failed or completed_coder_tasks == 0 else "completed"
+                    if completed_coder_tasks == 0 and failed == 0:
+                        await escalation_manager.write_escalation(
+                            task_id="planner",
+                            job_id=job_id,
+                            reason="Planner produced no completed coder tasks; no files were created.",
+                            retry_count=0,
+                        )
+                        self._publish_event(
+                            {
+                                "type": "agent_log",
+                                "message": "Job failed: planner produced no completed coder tasks, so no files were created.",
+                                "level": "error",
+                            }
+                        )
+                    await self.job_manager.update_job_state(job_id, final_state)
                     self._publish_event(
                         {
                             "type": "job_state_changed",
                             "job_id": job_id,
-                            "new_state": "completed",
+                            "new_state": final_state,
                         }
                     )
                     break
@@ -197,6 +217,16 @@ class Orchestrator:
 
             for task in ready_tasks:
                 await self._dispatch_task(task, workspace_manager, escalation_manager)
+                if await self.scheduler.count_failed_tasks(job_id) > 0:
+                    await self.job_manager.update_job_state(job_id, "failed")
+                    self._publish_event(
+                        {
+                            "type": "job_state_changed",
+                            "job_id": job_id,
+                            "new_state": "failed",
+                        }
+                    )
+                    return
                 if await self.scheduler.count_active_tasks(job_id) == 0:
                     break
 
@@ -218,20 +248,46 @@ class Orchestrator:
         # Brief pause to allow UI to display task start
         await asyncio.sleep(0.2)
 
-        if task.agent_type == AgentType.CODER.value:
-            await self._run_coder_task(task, workspace, escalation_manager)
-        elif task.agent_type == AgentType.TESTER.value:
-            await self._run_tester_task(task)
-        elif task.agent_type == AgentType.SYNTHESIZER.value:
-            await self._run_synthesizer_task(task)
-        else:
-            await self.scheduler.transition(task.task_id, "completed")
+        try:
+            if task.agent_type == AgentType.CODER.value:
+                await self._run_coder_task(task, workspace, escalation_manager)
+            elif task.agent_type == AgentType.TESTER.value:
+                await self._run_tester_task(task)
+            elif task.agent_type == AgentType.SYNTHESIZER.value:
+                await self._run_synthesizer_task(task)
+            else:
+                await self.scheduler.transition(task.task_id, "completed")
+                self._publish_event(
+                    {
+                        "type": "task_state_changed",
+                        "task_id": task.task_id,
+                        "agent_type": task.agent_type,
+                        "new_state": "completed",
+                    }
+                )
+        except Exception as exc:
+            logger.exception("Task %s failed during %s execution", task.task_id, task.agent_type)
+            await self.scheduler.transition(task.task_id, "failed", reason=str(exc))
+            await escalation_manager.write_escalation(
+                task_id=task.task_id,
+                job_id=task.job_id,
+                reason=str(exc),
+                retry_count=task.retry_count,
+            )
             self._publish_event(
                 {
                     "type": "task_state_changed",
                     "task_id": task.task_id,
                     "agent_type": task.agent_type,
-                    "new_state": "completed",
+                    "new_state": "failed",
+                    "reason": str(exc),
+                }
+            )
+            self._publish_event(
+                {
+                    "type": "agent_log",
+                    "message": f"Task {task.task_id} failed: {exc}",
+                    "level": "error",
                 }
             )
         
@@ -272,14 +328,25 @@ class Orchestrator:
             raise RuntimeError("Planner did not return a PlannerOutput")
         return output
 
-    def _create_tasks_from_planner(self, planner_output: PlannerOutput, job_id: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _create_tasks_from_planner(planner_output: PlannerOutput, job_id: str) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc).isoformat()
+        task_id_map = {
+            task.task_id: f"{job_id}:{task.task_id}"
+            for task in planner_output.tasks
+        }
+        known_task_ids = set(task_id_map.values())
         tasks = []
         for task in planner_output.tasks:
-            state = "pending" if not task.dependencies else "blocked"
+            dependencies = [
+                mapped_dependency
+                for dependency in task.dependencies
+                if (mapped_dependency := task_id_map.get(dependency, dependency)) in known_task_ids
+            ]
+            state = "pending" if not dependencies else "blocked"
             tasks.append(
                 {
-                    "task_id": task.task_id,
+                    "task_id": task_id_map[task.task_id],
                     "job_id": job_id,
                     "title": task.title,
                     "description": task.description,
@@ -287,7 +354,7 @@ class Orchestrator:
                     "state": state,
                     "priority": task.priority,
                     "retry_count": 0,
-                    "dependencies": task.dependencies,
+                    "dependencies": dependencies,
                     "created_at": now,
                     "updated_at": now,
                     "version": 0,
@@ -388,6 +455,19 @@ class Orchestrator:
 
         self.previous_coder_outputs[task.task_id] = current_modifications
 
+        if not coder_output.file_modifications:
+            await self.scheduler.transition(task.task_id, "failed", reason="Coder produced no file modifications")
+            self._publish_event(
+                {
+                    "type": "task_state_changed",
+                    "task_id": task.task_id,
+                    "agent_type": task.agent_type,
+                    "new_state": "failed",
+                    "reason": "Coder produced no file modifications",
+                }
+            )
+            return
+
         modified_files: list[str] = []
         for change in coder_output.file_modifications:
             workspace_manager.write_file(change.file_path, change.content)
@@ -483,10 +563,11 @@ class Orchestrator:
                 "overall_assessment": critic_output.overall_assessment,
                 "issues": [
                     {
-                        "severity": issue.get("severity", "unknown"),
-                        "message": issue.get("message", ""),
-                        "line": issue.get("line", 0),
-                        "file": issue.get("file", ""),
+                        "severity": issue.severity,
+                        "message": issue.description,
+                        "line": issue.line_number,
+                        "file": issue.file_path,
+                        "suggested_fix": issue.suggested_fix,
                     }
                     for issue in critic_output.issues
                 ],

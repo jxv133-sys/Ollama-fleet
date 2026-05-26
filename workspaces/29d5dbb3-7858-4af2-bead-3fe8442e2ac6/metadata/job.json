@@ -1,9 +1,0 @@
-{
-  "job_id": "29d5dbb3-7858-4af2-bead-3fe8442e2ac6",
-  "goal": "Create a complete data analysis Python package with utils, analyzers, validators, and CLI interface",
-  "created_at": "2026-05-25T20:41:01.912593+00:00",
-  "config": {
-    "source": "advanced_fleet_test",
-    "difficulty": "hard"
-  }
-}

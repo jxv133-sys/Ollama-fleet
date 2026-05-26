@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-05-26T00:59:09.563355+00:00",
+  "agent_type": "planner",
+  "tasks_created": 2,
+  "milestones": [
+    "Milestone 1 description",
+    "Milestone 2 description"
+  ],
+  "architecture_notes": "Overall architecture description and design decisions.",
+  "tasks": [
+    {
+      "task_id": "77b00227-dc9f-48df-8261-074b44a61f27:task_001",
+      "title": "Brief task title",
+      "description": "Detailed task description",
+      "agent_type": "coder",
+      "dependencies": [],
+      "priority": 1
+    },
+    {
+      "task_id": "77b00227-dc9f-48df-8261-074b44a61f27:task_002",
+      "title": "Task 2 brief description",
+      "description": "Detailed task 2 description",
+      "agent_type": "tester",
+      "dependencies": [
+        "77b00227-dc9f-48df-8261-074b44a61f27:task_001"
+      ],
+      "priority": 8
+    }
+  ]
+}
