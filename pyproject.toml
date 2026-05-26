@@ -15,6 +15,8 @@ dependencies = [
     "textual>=0.61",
     "rich>=13",
     "aiosqlite>=0.20",
+    "fastapi>=0.111",
+    "uvicorn>=0.29",
     # tomllib is in stdlib for Python 3.11+; tomli is the backport for older versions
     "tomli>=2.0; python_version < '3.11'",
 ]
