@@ -84,17 +84,18 @@ class ValidationLayer:
         if linter_available and proc is not None and proc.stdout:
             try:
                 parsed = json.loads(proc.stdout)
+                # ruff --format json outputs a flat list of objects with keys:
+                # filename, row, col, code, message, fix, url
                 for item in parsed:
-                    for message in item.get("messages", []):
-                        lint_results.append(
-                            LintIssue(
-                                file_path=item.get("path", ""),
-                                line_number=message.get("line", 0),
-                                code=message.get("code", ""),
-                                message=message.get("message", ""),
-                                severity=message.get("severity", "warning"),
-                            )
+                    lint_results.append(
+                        LintIssue(
+                            file_path=item.get("filename", ""),
+                            line_number=item.get("row", 0),
+                            code=item.get("code", ""),
+                            message=item.get("message", ""),
+                            severity="warning",
                         )
+                    )
             except json.JSONDecodeError:
                 linter_available = False
 

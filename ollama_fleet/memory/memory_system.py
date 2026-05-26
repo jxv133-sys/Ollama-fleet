@@ -7,7 +7,7 @@ from typing import Any
 
 from ollama_fleet.config import FleetSettings
 from ollama_fleet.memory.episodic import EpisodicEntry, EpisodicMemory
-from ollama_fleet.memory.long_term import LongTermMemory
+from ollama_fleet.memory.long_term import LongTermEntry, LongTermMemory
 from ollama_fleet.ollama.client import OllamaClient
 from ollama_fleet.db.database import Database
 

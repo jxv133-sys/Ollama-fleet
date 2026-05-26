@@ -63,13 +63,15 @@ class ShellTools:
         failed = 0
         failures: list[dict[str, str]] = []
 
+        # Parse pytest's summary line, e.g. "5 passed, 2 failed in 0.12s"
+        import re
         for line in stdout.splitlines():
-            if line.strip().endswith(" passed"):
-                passed += 1
-            if line.strip().endswith(" failed"):
-                failed_count = line.strip().split()[0]
-                if failed_count.isdigit():
-                    failed += int(failed_count)
+            summary_match = re.search(r'(\d+) passed', line)
+            if summary_match:
+                passed = int(summary_match.group(1))
+            failed_match = re.search(r'(\d+) failed', line)
+            if failed_match:
+                failed = int(failed_match.group(1))
 
         if failed > 0:
             failures.append({"message": stderr.strip()})

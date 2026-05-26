@@ -206,10 +206,11 @@ class OllamaClient:
     async def list_models(self) -> list[dict[str, Any]]:
         """Return the list of models available on the Ollama server.
 
-        Performs a GET request to ``/api/models`` and returns the parsed JSON
-        response which is expected to be a list of model metadata objects.
+        Performs a GET request to ``/api/tags`` (the real Ollama endpoint) and
+        returns the parsed list of model metadata objects from the ``models`` key.
+        Falls back to ``/api/models`` for compatibility with non-standard servers.
         """
-        endpoints = ["/api/models", "/models"]
+        endpoints = ["/api/tags", "/api/models", "/models"]
         last_err: Exception | None = None
         async with httpx.AsyncClient() as client:
             for ep in endpoints:
@@ -217,18 +218,19 @@ class OllamaClient:
                 try:
                     resp = await client.get(url, timeout=10.0)
                     if resp.status_code == 404:
-                        # try the next candidate endpoint
                         last_err = OllamaHTTPError(status_code=resp.status_code, body=resp.text)
                         continue
                     if resp.status_code >= 400:
                         raise OllamaHTTPError(status_code=resp.status_code, body=resp.text)
-                    return resp.json()
+                    payload = resp.json()
+                    # /api/tags returns {"models": [...]}; unwrap if needed
+                    if isinstance(payload, dict) and "models" in payload:
+                        return payload["models"]
+                    return payload
                 except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                     last_err = OllamaConnectionError(f"Could not connect to Ollama at {self.base_url}: {exc}")
                     break
 
-        # If we get here, none of the endpoints succeeded. Raise the last error if present,
-        # otherwise return an empty list to allow callers to fall back.
         if last_err:
             raise last_err
         return []

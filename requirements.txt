@@ -1,5 +1,8 @@
 httpx[http2]
 aiosqlite
-pydantic>=1.10
+pydantic>=2.0
 textual>=0.20.0
 pytest
+hypothesis
+ruff
+toml

@@ -21,7 +21,6 @@ from ollama_fleet.memory.episodic import EpisodicEntry
 from ollama_fleet.memory.memory_system import MemorySystem
 from ollama_fleet.orchestrator.escalation import EscalationManager
 from ollama_fleet.orchestrator.job_manager import JobManager
-from ollama_fleet.scheduler.dependency_resolver import DependencyResolver
 from ollama_fleet.scheduler.task_scheduler import ScheduledTask, TaskScheduler
 from ollama_fleet.validation.validator import ValidationLayer
 from ollama_fleet.ui.event_bus import UIEventBus
@@ -43,7 +42,6 @@ class Orchestrator:
         self.settings = settings
         self.job_manager = JobManager(db)
         self.scheduler = TaskScheduler(db)
-        self.dependency_resolver = DependencyResolver(db)
         self.executor = AgentExecutor(OllamaClient(settings.ollama.base_url), settings)
         self.validation = ValidationLayer()
         self.memory_system = MemorySystem(db, settings, self.executor.client)
@@ -176,6 +174,12 @@ class Orchestrator:
         workspace_manager: WorkspaceManager,
         escalation_manager: EscalationManager,
     ) -> None:
+        semaphore = asyncio.Semaphore(self.settings.scheduler.max_concurrent_tasks)
+
+        async def _dispatch_with_semaphore(task: ScheduledTask) -> None:
+            async with semaphore:
+                await self._dispatch_task(task, workspace_manager, escalation_manager)
+
         while True:
             await self.scheduler.resolve_dependencies(job_id)
             await self.scheduler.recover_stalled_tasks(job_id, self.settings.scheduler.stall_timeout)
@@ -215,20 +219,23 @@ class Orchestrator:
                 await asyncio.sleep(0.1)
                 continue
 
-            for task in ready_tasks:
-                await self._dispatch_task(task, workspace_manager, escalation_manager)
-                if await self.scheduler.count_failed_tasks(job_id) > 0:
-                    await self.job_manager.update_job_state(job_id, "failed")
-                    self._publish_event(
-                        {
-                            "type": "job_state_changed",
-                            "job_id": job_id,
-                            "new_state": "failed",
-                        }
-                    )
-                    return
-                if await self.scheduler.count_active_tasks(job_id) == 0:
-                    break
+            # Dispatch all ready tasks concurrently up to max_concurrent_tasks
+            dispatch_tasks = [
+                asyncio.create_task(_dispatch_with_semaphore(task))
+                for task in ready_tasks
+            ]
+            await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+
+            if await self.scheduler.count_failed_tasks(job_id) > 0:
+                await self.job_manager.update_job_state(job_id, "failed")
+                self._publish_event(
+                    {
+                        "type": "job_state_changed",
+                        "job_id": job_id,
+                        "new_state": "failed",
+                    }
+                )
+                return
 
     async def _dispatch_task(
         self,
@@ -668,6 +675,27 @@ class Orchestrator:
         )
 
     async def _run_tester_task(self, task: ScheduledTask) -> None:
+        # Gather actual workspace state for the tester
+        job = await self.job_manager.get_job(task.job_id)
+        workspace_state = ""
+        test_results = ""
+        if job is not None:
+            try:
+                ws = WorkspaceManager(job.workspace_path)
+                py_files = [
+                    str(p.relative_to(ws.root))
+                    for p in ws.root.rglob("*.py")
+                    if p.is_file()
+                ]
+                workspace_state = "\n".join(py_files)
+                # Run tests and capture output
+                from ollama_fleet.tools.shell_tools import ShellTools
+                shell = ShellTools(ws.root)
+                run_result = shell.run_tests(timeout=self.settings.tools.command_timeout)
+                test_results = run_result.get("stdout", "") + run_result.get("stderr", "")
+            except Exception:
+                pass
+
         tester_output = await self.executor.execute(
             {
                 "task_id": task.task_id,
@@ -675,7 +703,7 @@ class Orchestrator:
                 "description": task.description,
             },
             AgentType.TESTER,
-            extra_context={"workspace_state": "", "test_results": ""},
+            extra_context={"workspace_state": workspace_state, "test_results": test_results},
         )
         if isinstance(tester_output, TesterOutput):
             self._publish_event(
@@ -700,17 +728,40 @@ class Orchestrator:
         )
 
     async def _run_synthesizer_task(self, task: ScheduledTask) -> None:
+        # Gather actual job context for the synthesizer
+        job = await self.job_manager.get_job(task.job_id)
+        goal = ""
+        completed_summaries: list[str] = []
+        files_produced: list[str] = []
+        if job is not None:
+            goal = job.goal
+            try:
+                ws = WorkspaceManager(job.workspace_path)
+                files_produced = [
+                    str(p.relative_to(ws.root))
+                    for p in ws.root.rglob("*")
+                    if p.is_file() and not p.name.startswith(".")
+                ]
+                # Pull episodic summaries for context
+                memory_ctx = await self.memory_system.assemble_context(
+                    task_description=task.description,
+                    job_id=task.job_id,
+                )
+                completed_summaries = memory_ctx.episodic_summaries
+            except Exception:
+                pass
+
         synthesizer_output = await self.executor.execute(
             {
                 "task_id": task.task_id,
-                "goal": "",
+                "goal": goal,
                 "description": task.description,
             },
             AgentType.SYNTHESIZER,
             extra_context={
-                "goal": "",
-                "completed_summaries": [],
-                "files_produced": [],
+                "goal": goal,
+                "completed_summaries": completed_summaries,
+                "files_produced": files_produced,
             },
         )
         if isinstance(synthesizer_output, SynthesizerOutput):
@@ -780,13 +831,13 @@ class Orchestrator:
                             except Exception:
                                 # best-effort: continue even if workspace unavailable
                                 pass
-                        await self._publish_event({
+                        self._publish_event({
                             "type": "task_state_changed",
                             "task_id": task_id,
                             "agent_type": agent_type,
                             "new_state": "failed",
                         })
-                        await self._publish_event({
+                        self._publish_event({
                             "type": "agent_log",
                             "message": f"Task {task_id} failed: stalled and retry limit exceeded.",
                         })
@@ -814,13 +865,13 @@ class Orchestrator:
                             except Exception:
                                 pass
 
-                        await self._publish_event({
+                        self._publish_event({
                             "type": "task_state_changed",
                             "task_id": task_id,
                             "agent_type": agent_type,
                             "new_state": "pending",
                         })
-                        await self._publish_event({
+                        self._publish_event({
                             "type": "agent_log",
                             "message": f"Task {task_id} requeued after stall; retry {new_retry}.",
                         })
