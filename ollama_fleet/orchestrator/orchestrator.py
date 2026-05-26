@@ -328,8 +328,9 @@ class Orchestrator:
     def _publish_event(self, event: dict[str, Any]) -> None:
         try:
             self.ui_bus.publish(event)
-        except Exception:
-            pass
+        except Exception as exc:
+            # UI bus failures are non-fatal but logged for debugging
+            logger.debug("Failed to publish event: %s", exc)
 
     async def _run_planner(self, goal: str) -> PlannerOutput:
         output = await self.executor.execute(
@@ -721,8 +722,8 @@ class Orchestrator:
                 shell = ShellTools(ws.root)
                 run_result = shell.run_tests(timeout=self.settings.tools.command_timeout)
                 test_results = run_result.get("stdout", "") + run_result.get("stderr", "")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to run tests for workspace: %s", exc)
 
         tester_output = await self.executor.execute(
             {
@@ -776,8 +777,8 @@ class Orchestrator:
                     job_id=task.job_id,
                 )
                 completed_summaries = memory_ctx.episodic_summaries
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to assemble episodic memory for synthesizer: %s", exc)
 
         synthesizer_output = await self.executor.execute(
             {

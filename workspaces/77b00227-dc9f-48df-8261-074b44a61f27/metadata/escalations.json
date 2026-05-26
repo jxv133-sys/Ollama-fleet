@@ -1,9 +1,0 @@
-[
-  {
-    "task_id": "77b00227-dc9f-48df-8261-074b44a61f27:task_001",
-    "job_id": "77b00227-dc9f-48df-8261-074b44a61f27",
-    "reason": "'CriticIssue' object has no attribute 'get'",
-    "retry_count": 0,
-    "timestamp": "2026-05-26T00:59:23.812483+00:00"
-  }
-]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import tempfile
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,10 +41,53 @@ class EscalationManager:
         )
 
     def _append_metadata(self, record: dict[str, Any]) -> None:
+        """Atomically append an escalation record to the metadata file.
+        
+        Uses atomic write pattern (temp file + rename) to prevent
+        data loss from concurrent writes.
+        """
         target = self._workspace.root / "metadata" / "escalations.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        
+        existing = []
         if target.exists():
-            existing = json.loads(target.read_text(encoding="utf-8"))
-        else:
-            existing = []
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+                if not isinstance(existing, list):
+                    existing = []
+            except (json.JSONDecodeError, OSError):
+                # If file is corrupted/unreadable, start fresh
+                existing = []
+        
         existing.append(record)
-        target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        
+        # Atomic write using temp file + rename
+        temp_file = None
+        try:
+            temp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+                dir=target.parent,
+                suffix=".json",
+                prefix=".escalations_tmp_",
+            )
+            temp_file.write(json.dumps(existing, indent=2))
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_file.close()
+            os.replace(str(temp_file.name), str(target))
+        except (OSError, IOError) as exc:
+            if temp_file is not None:
+                try:
+                    temp_file.close()
+                except OSError:
+                    pass
+                try:
+                    if Path(temp_file.name).exists():
+                        Path(temp_file.name).unlink()
+                except OSError:
+                    pass
+            # Log the error but don't crash - escalation is already in the database
+            import logging
+            logging.warning(f"Failed to write escalation metadata: {exc}")
