@@ -156,6 +156,15 @@ class AgentExecutor:
                 mod["file_path"] = mod.pop("path")
             if "content" not in mod:
                 mod["content"] = ""
+            # Strip leading slash from absolute paths so the workspace manager
+            # can safely join them with the workspace root. Models sometimes
+            # return placeholder paths like "/path/to/file.py".
+            if "file_path" in mod:
+                fp = mod["file_path"]
+                if isinstance(fp, str) and fp.startswith("/"):
+                    from pathlib import Path as _Path
+                    p = _Path(fp)
+                    mod["file_path"] = str(p.relative_to(p.anchor))
         
         # Ensure confidence_score exists and is in range
         if "confidence_score" not in data:

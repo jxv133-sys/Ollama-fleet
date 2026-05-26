@@ -478,11 +478,21 @@ class Orchestrator:
         modified_files: list[str] = []
         for change in coder_output.file_modifications:
             workspace_manager.write_file(change.file_path, change.content)
-            modified_files.append(change.file_path)
+            # Normalize to a workspace-relative path so downstream consumers
+            # (validator, critic, episodic memory) can safely join it with
+            # workspace_manager.root. The model may return absolute paths like
+            # "/path/to/file.py" or placeholders; write_file already strips the
+            # leading anchor, so we derive the canonical relative path from the
+            # resolved absolute path that was actually written.
+            raw = Path(change.file_path)
+            if raw.is_absolute():
+                raw = raw.relative_to(raw.anchor)
+            rel_path = str(raw)
+            modified_files.append(rel_path)
             # Publish file written event
             self._publish_event({
                 "type": "file_written",
-                "path": change.file_path,
+                "path": rel_path,
                 "job_id": task.job_id,
             })
 
