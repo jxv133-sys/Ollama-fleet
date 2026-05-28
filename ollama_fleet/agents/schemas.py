@@ -21,6 +21,7 @@ class PlannerTask(BaseModel):
     """A single task produced by the Planner_Agent."""
 
     task_id: str
+    step_number: int = Field(ge=1)
     title: str
     description: str
     agent_type: Literal["coder", "tester", "synthesizer"]
@@ -34,6 +35,8 @@ class PlannerOutput(BaseModel):
     Validates: Requirements 5.1
     """
 
+    clarifying_questions: list[str] = []
+    technical_requirements: list[str] = []
     tasks: list[PlannerTask]
     milestones: list[str]
     architecture_notes: str

@@ -6,9 +6,6 @@ schema validation for planner, coder, critic, tester, and synthesizer agents.
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from pydantic import ValidationError
 
 from ollama_fleet.agents.schemas import (
@@ -26,10 +23,12 @@ from ollama_fleet.ollama.client import OllamaClient
 
 _PROMPT_TEMPLATES: dict[AgentType, str] = {
     AgentType.PLANNER: (
-        "You are a planning agent. Analyze the goal and generate a structured plan. "
+        "You are a planning agent. Analyze the goal and existing context. "
+        "If details are missing, ask clarifying questions before producing final plan. "
+        "Build a numbered task list that covers the full project and includes technical requirements. "
         "Output valid JSON only."
-        "\n\nRequired keys: tasks, milestones, architecture_notes."
-        "\nTask list item: task_id, title, description, agent_type, dependencies, priority."
+        "\n\nRequired keys: clarifying_questions, technical_requirements, tasks, milestones, architecture_notes."
+        "\nTask list item: task_id, step_number, title, description, agent_type, dependencies, priority."
     ),
     AgentType.CODER: (
         "You are a coding agent. Generate file changes based on the task and existing context. "
@@ -134,6 +133,56 @@ class AgentPipeline:
         model = self.select_model(agent_type)
         response = await self.client.generate(model, prompt, timeout or self.default_timeout)
         return self.parse_agent_output(agent_type, response)
+
+    async def run_planner(self, user_prompt: str, context: str = "") -> PlannerOutput:
+        """Run the planning agent against a user prompt and context."""
+        return await self.run_agent(AgentType.PLANNER, user_prompt, context)  # type: ignore[return-value]
+
+    async def run_coder_sequence(
+        self,
+        planner_output: PlannerOutput,
+        context: str = "",
+    ) -> list[CoderOutput]:
+        """Execute coder tasks sequentially in step order."""
+        coder_outputs: list[CoderOutput] = []
+        ordered_tasks = sorted(planner_output.tasks, key=lambda task: task.step_number)
+
+        for task in ordered_tasks:
+            if task.agent_type != "coder":
+                continue
+            task_context = (
+                f"{context}\n\nPrevious tasks:\n"
+                + "\n".join(
+                    f"{t.step_number}. {t.title} ({t.agent_type})" for t in ordered_tasks if t.step_number < task.step_number
+                )
+            )
+            result = await self.run_agent(
+                AgentType.CODER,
+                task_description=task.description,
+                context=task_context,
+            )
+            coder_outputs.append(result)
+
+        return coder_outputs
+
+    async def run_scoring(
+        self,
+        code_context: str,
+        context: str = "",
+    ) -> tuple[CriticOutput, TesterOutput]:
+        """Run critic and tester agents after coding is complete."""
+        critic_output = await self.run_agent(
+            AgentType.CRITIC,
+            task_description="Review the produced code and identify issues.",
+            context=code_context,
+        )  # type: ignore[return-value]
+        tester_output = await self.run_agent(
+            AgentType.TESTER,
+            task_description="Run tests against the produced code and report failures.",
+            context=code_context,
+        )  # type: ignore[return-value]
+
+        return critic_output, tester_output
 
     def build_prompt_with_model(self, agent_type: AgentType, task_description: str, context: str = "") -> tuple[str, str]:
         """Return both selected model and final prompt text."""
