@@ -46,6 +46,12 @@ def _mock_stream_response(lines: list[str], status_code: int = 200):
     resp = MagicMock()
     resp.status_code = status_code
     resp.aiter_lines = _aiter_lines
+
+    async def _aiter_bytes():
+        for line in lines:
+            yield f"{line}\n".encode("utf-8")
+
+    resp.aiter_bytes = _aiter_bytes
     resp.aread = AsyncMock(return_value=b"error body")
 
     @asynccontextmanager
@@ -143,6 +149,98 @@ async def test_generate_missing_response_field():
         result = await client.generate("llama3", "prompt", timeout=30.0)
 
     assert result == "world"
+
+
+@pytest.mark.asyncio
+async def test_generate_accumulates_thinking_chunks_when_response_empty():
+    """When response is empty, thinking chunks are concatenated."""
+    lines = _make_stream_lines(
+        {"thinking": "a", "done": False},
+        {"thinking": "b", "done": False},
+        {"thinking": "c", "done": True},
+    )
+    ctx = _mock_stream_response(lines)
+
+    with patch("ollama_fleet.ollama.client.httpx.AsyncClient", ctx):
+        client = OllamaClient()
+        result = await client.generate("llama3", "prompt", timeout=30.0)
+
+    assert result == "abc"
+
+
+@pytest.mark.asyncio
+async def test_generate_handles_partial_byte_chunks():
+    """Byte chunks that split a JSON line are still parsed correctly."""
+
+    @asynccontextmanager
+    async def _capturing_client(*args, **kwargs):
+        mock = MagicMock()
+
+        @asynccontextmanager
+        async def _stream(method, url, *, json, timeout):
+            resp = MagicMock()
+            resp.status_code = 200
+
+            async def _aiter_lines():
+                yield '{"response":"hel'
+                yield 'lo","done":true}'
+
+            async def _aiter_bytes():
+                yield b'{"response":"hel'
+                yield b'lo","done":true}\n'
+
+            resp.aiter_lines = _aiter_lines
+            resp.aiter_bytes = _aiter_bytes
+            resp.aread = AsyncMock(return_value=b"")
+            yield resp
+
+        mock.stream = _stream
+        yield mock
+
+    with patch("ollama_fleet.ollama.client.httpx.AsyncClient", _capturing_client):
+        client = OllamaClient()
+        result = await client.generate("llama3", "prompt", timeout=30.0)
+
+    assert result == "hello"
+
+
+@pytest.mark.asyncio
+async def test_generate_disables_proxy_behavior_and_uses_identity_encoding():
+    captured: dict[str, Any] = {}
+
+    @asynccontextmanager
+    async def _capturing_client(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+        mock = MagicMock()
+
+        @asynccontextmanager
+        async def _stream(method, url, *, json, timeout):
+            resp = MagicMock()
+            resp.status_code = 200
+
+            async def _aiter_lines():
+                yield '{"response":"ok","done":true}'
+
+            async def _aiter_bytes():
+                yield b'{"response":"ok","done":true}\n'
+
+            resp.aiter_lines = _aiter_lines
+            resp.aiter_bytes = _aiter_bytes
+            resp.aread = AsyncMock(return_value=b"")
+            yield resp
+
+        mock.stream = _stream
+        yield mock
+
+    with patch("ollama_fleet.ollama.client.httpx.AsyncClient", _capturing_client):
+        client = OllamaClient()
+        await client.generate("llama3", "prompt", timeout=30.0)
+
+    assert captured["kwargs"]["http2"] is False
+    assert captured["kwargs"]["trust_env"] is False
+    assert captured["kwargs"]["headers"]["Accept-Encoding"] == "identity"
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +381,9 @@ async def test_generate_raises_timeout_error_on_pool_timeout():
 
 
 def test_client_default_base_url():
-    """OllamaClient defaults to http://localhost:11434."""
+    """OllamaClient defaults to http://192.168.50.142:7869."""
     client = OllamaClient()
-    assert client.base_url == "http://localhost:11434"
+    assert client.base_url == "http://192.168.50.142:7869"
 
 
 def test_client_custom_base_url():
@@ -322,7 +420,11 @@ async def test_generate_posts_to_correct_endpoint():
             async def _aiter_lines():
                 yield json_line({"response": "ok", "done": True})
 
+            async def _aiter_bytes():
+                yield json_line({"response": "ok", "done": True}).encode("utf-8")
+
             resp.aiter_lines = _aiter_lines
+            resp.aiter_bytes = _aiter_bytes
             yield resp
 
         mock.stream = _stream

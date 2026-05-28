@@ -1,0 +1,30 @@
+# Ollama Fleet config for model experimentation
+[ollama]
+base_url = "http://192.168.50.142:7869"
+planner_model = "hf.co/bartowski/Qwen2.5-Coder-14B-Instruct-abliterated-GGUF:Q4_K_M"
+coder_model = "hf.co/Jackrong/Qwopus3.5-9B-Coder-MTP-GGUF:Q4_K_M"
+summarizer_model = "hf.co/LEONW24/Qwen3.5-9B-Uncensored:Q4_K_M"
+critic_model = "hf.co/KevinJK51/Qwen3.6-12B-IQ-Ultra-Heretic-Uncensored-Thinking-V2-Hightop-GGUF:Q5_0"
+tester_model = "hf.co/SpaceTimee/Suri-Qwen-3.1-4B-Uncensored-GGUF:Q4_K_M"
+timeout = 600.0
+
+[scheduler]
+retry_limit = 3
+max_concurrent_tasks = 4
+poll_interval = 2.0
+max_critique_revision_loops = 3
+stall_timeout = 600.0
+
+[memory]
+max_context_tokens = 8192
+episodic_window = 5
+
+[workspace]
+base_path = "./workspaces"
+
+[ui]
+refresh_rate = 1.0
+
+[tools]
+command_timeout = 60
+git_enabled = true

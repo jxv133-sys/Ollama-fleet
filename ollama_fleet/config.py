@@ -25,13 +25,13 @@ from pydantic import BaseModel, Field, ValidationError
 class OllamaConfig(BaseModel):
     """Settings for the Ollama server and model assignments."""
 
-    base_url: str = "http://localhost:11434"
-    planner_model: str = "llama3"
-    coder_model: str = "llama3"
-    summarizer_model: str = "llama3"
+    base_url: str = "http://192.168.50.142:7869"
+    planner_model: str = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
+    coder_model: str = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
+    summarizer_model: str = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
     # None means "default to coder_model" at runtime
-    critic_model: str | None = None
-    tester_model: str | None = None
+    critic_model: str | None = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
+    tester_model: str | None = "hf.co/Jiunsong/supergemma4-26b-uncensored-gguf-v2:Q4_K_M"
     timeout: float = Field(default=600.0, ge=300.0, le=3600.0)
 
 
