@@ -56,6 +56,8 @@ class PlannerOutput(BaseModel):
     Validates: Requirements 5.1
     """
 
+    clarifying_questions: list[str] = []
+    technical_requirements: list[str] = []
     tasks: list[PlannerTask]
     milestones: list[str]
     architecture_notes: str

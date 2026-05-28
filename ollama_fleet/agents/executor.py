@@ -172,6 +172,26 @@ class AgentExecutor:
 
         data["tasks"] = normalized
 
+        # Ensure clarifying_questions is a list of strings
+        clarifying = data.get("clarifying_questions", [])
+        if isinstance(clarifying, str):
+            clarifying = [clarifying]
+        elif isinstance(clarifying, dict):
+            clarifying = [str(v) for v in clarifying.values()]
+        elif clarifying is None:
+            clarifying = []
+        data["clarifying_questions"] = [str(item) for item in clarifying if item is not None]
+
+        # Ensure technical_requirements is a list of strings
+        requirements = data.get("technical_requirements", [])
+        if isinstance(requirements, str):
+            requirements = [requirements]
+        elif isinstance(requirements, dict):
+            requirements = [str(v) for v in requirements.values()]
+        elif requirements is None:
+            requirements = []
+        data["technical_requirements"] = [str(item) for item in requirements if item is not None]
+
         # Ensure milestones is a list of strings (not objects)
         milestones = data.get("milestones", [])
         if not isinstance(milestones, list):
