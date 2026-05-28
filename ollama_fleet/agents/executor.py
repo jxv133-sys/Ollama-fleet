@@ -125,6 +125,7 @@ class AgentExecutor:
         """Normalize Planner output: fix field names, types, flatten structures."""
         # tasks may be a dict keyed by task_id — convert to list first
         raw_tasks = data.get("tasks", [])
+        logger.debug(f"🔧 Normalizing planner output with {len(raw_tasks)} raw tasks")
         if isinstance(raw_tasks, dict):
             raw_tasks = [{"task_id": k, **v} if isinstance(v, dict) else {"task_id": k, "description": str(v)} for k, v in raw_tasks.items()]
             data["tasks"] = raw_tasks
@@ -168,6 +169,17 @@ class AgentExecutor:
                 except (ValueError, TypeError):
                     task["priority"] = 5
 
+            # Ensure step_number exists and is an int (required by schema)
+            if "step_number" not in task:
+                task["step_number"] = i + 1
+                logger.debug(f"✏️ Added step_number={i + 1} to task {task.get('task_id')}")
+            else:
+                try:
+                    task["step_number"] = int(task["step_number"])
+                except (ValueError, TypeError):
+                    task["step_number"] = i + 1
+                    logger.debug(f"✏️ Corrected step_number to {i + 1} for task {task.get('task_id')}")
+
             normalized.append(task)
 
         data["tasks"] = normalized
@@ -209,6 +221,7 @@ class AgentExecutor:
             arch = str(arch)
         data["architecture_notes"] = arch or ""
 
+        logger.debug(f"✅ Normalized {len(data.get('tasks', []))} tasks for planner output")
         return data
 
     def _normalize_coder_output(self, data: dict[str, Any]) -> dict[str, Any]:

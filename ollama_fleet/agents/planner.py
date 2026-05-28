@@ -6,6 +6,7 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
   "tasks": [
     {
       "task_id": "task_001",
+      "step_number": 1,
       "title": "Implement core data models",
       "description": "Create src/models.py with all data classes and type definitions needed by the application. Include docstrings and type hints.",
       "agent_type": "coder",
@@ -14,6 +15,7 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
     },
     {
       "task_id": "task_002",
+      "step_number": 2,
       "title": "Implement business logic",
       "description": "Create src/logic.py with the main application logic. Import from models.py. Handle edge cases and errors.",
       "agent_type": "coder",
@@ -22,6 +24,7 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
     },
     {
       "task_id": "task_003",
+      "step_number": 3,
       "title": "Implement CLI entry point",
       "description": "Create main.py as the runnable entry point. Import from src/logic.py. Add argument parsing and user-facing output.",
       "agent_type": "coder",
@@ -30,6 +33,7 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
     },
     {
       "task_id": "task_004",
+      "step_number": 4,
       "title": "Write unit tests",
       "description": "Create tests/test_logic.py with pytest tests covering the main functions in src/logic.py. Test normal cases and edge cases.",
       "agent_type": "tester",
@@ -38,6 +42,7 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
     },
     {
       "task_id": "task_005",
+      "step_number": 5,
       "title": "Summarize completed project",
       "description": "Review all produced files and write a summary of what was built, how to run it, and what was accomplished.",
       "agent_type": "synthesizer",
@@ -79,6 +84,8 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
         "9. technical_requirements: array of strings describing exact libraries, frameworks, file structure, and quality expectations.\n"
         "10. milestones: array of plain strings describing each phase of completion.\n"
         "11. architecture_notes: one paragraph describing the file structure, module layout, and design decisions.\n"
+        "12. **CRITICAL: Every task MUST have a step_number field (integer, starting from 1, incrementing by 1 for each task). "
+        "step_number defines the sequential order of task execution.**\n"
         "\n=== AGENT TYPES ===\n"
         "- 'coder': writes or modifies source files\n"
         "- 'tester': writes pytest test files\n"

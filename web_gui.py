@@ -155,11 +155,15 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.on_event("startup")
     async def _startup() -> None:
+        logger.info("🚀 Ollama Fleet web GUI starting up...")
         await state.startup()
+        logger.info("✅ Web GUI started, orchestrator ready")
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        logger.info("🛑 Web GUI shutting down...")
         await state.shutdown()
+        logger.info("✅ Web GUI shutdown complete")
 
     # -----------------------------------------------------------------------
     # WebSocket — real-time event stream
@@ -167,11 +171,13 @@ def create_app(state: AppState) -> FastAPI:
     @app.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket) -> None:
         await state.manager.connect(ws)
+        logger.info(f"📡 WebSocket client connected (total: {len(state.manager._clients)})")
         try:
             while True:
                 await ws.receive_text()  # keep connection alive; client sends pings
         except WebSocketDisconnect:
             state.manager.disconnect(ws)
+            logger.info(f"📡 WebSocket client disconnected (total: {len(state.manager._clients)})")
 
     # -----------------------------------------------------------------------
     # REST — job submission
@@ -179,10 +185,13 @@ def create_app(state: AppState) -> FastAPI:
     @app.post("/api/jobs")
     async def submit_job(body: dict[str, Any]) -> dict[str, Any]:
         if state.job_running:
+            logger.warning("⚠️ Job submission rejected: a job is already running")
             return {"error": "A job is already running"}
         goal = (body.get("goal") or "").strip()
         if not goal:
+            logger.warning("⚠️ Job submission rejected: no goal provided")
             return {"error": "goal is required"}
+        logger.info(f"📝 New job submitted with goal: {goal[:80]}...")
         model_overrides: dict[str, str] = body.get("models", {})
         base_url: str = body.get("base_url", "")
 
@@ -227,12 +236,15 @@ def create_app(state: AppState) -> FastAPI:
                     "SELECT job_id, goal, state, created_at, updated_at "
                     "FROM jobs ORDER BY updated_at DESC, created_at DESC LIMIT 100"
                 ).fetchall()
-            return [
+            result = [
                 {"job_id": r[0], "goal": r[1], "state": r[2],
                  "created_at": r[3], "updated_at": r[4]}
                 for r in rows
             ]
-        except sqlite3.Error:
+            logger.debug(f"📋 Listed {len(result)} jobs")
+            return result
+        except sqlite3.Error as e:
+            logger.error(f"❌ DB error listing jobs: {e}")
             return []
 
     @app.get("/api/jobs/{job_id}/tasks")
@@ -240,15 +252,27 @@ def create_app(state: AppState) -> FastAPI:
         try:
             with sqlite3.connect(state.db_path, timeout=2.0) as conn:
                 rows = conn.execute(
-                    "SELECT task_id, agent_type, state, created_at "
+                    "SELECT task_id, title, description, agent_type, state, priority, dependencies, created_at "
                     "FROM tasks WHERE job_id = ? ORDER BY created_at ASC",
                     (job_id,),
                 ).fetchall()
-            return [
-                {"task_id": r[0], "agent_type": r[1], "state": r[2], "created_at": r[3]}
+            result = [
+                {
+                    "task_id": r[0],
+                    "title": r[1],
+                    "description": r[2],
+                    "agent_type": r[3],
+                    "state": r[4],
+                    "priority": r[5],
+                    "dependencies": json.loads(r[6] or '[]'),
+                    "created_at": r[7],
+                }
                 for r in rows
             ]
-        except sqlite3.Error:
+            logger.debug(f"📋 Listed {len(result)} tasks for job {job_id[:8]}...")
+            return result
+        except sqlite3.Error as e:
+            logger.error(f"❌ DB error listing tasks for {job_id[:8]}...: {e}")
             return []
 
 
@@ -272,8 +296,11 @@ def create_app(state: AppState) -> FastAPI:
                 ids = [str(item.get("id") or item.get("name") if isinstance(item, dict) else item) for item in payload]
             else:
                 ids = []
-            return {"models": sorted({m for m in ids if m})}
+            models = sorted({m for m in ids if m})
+            logger.debug(f"✅ Fetched {len(models)} models from {endpoint}")
+            return {"models": models}
         except (HTTPError, URLError, Exception) as exc:
+            logger.warning(f"⚠️ Failed to fetch models from {endpoint}: {exc}")
             return {"models": [], "error": str(exc)}
 
     # -----------------------------------------------------------------------
@@ -282,9 +309,10 @@ def create_app(state: AppState) -> FastAPI:
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:
         if state.orchestrator is None:
+            logger.error("❌ Config request: orchestrator not ready")
             return {}
         s = state.orchestrator.settings
-        return {
+        config = {
             "base_url": s.ollama.base_url,
             "models": {
                 "planner": s.ollama.planner_model,
@@ -294,6 +322,8 @@ def create_app(state: AppState) -> FastAPI:
                 "synthesizer": s.ollama.summarizer_model,
             },
         }
+        logger.debug(f"📋 Config requested: base_url={s.ollama.base_url}")
+        return config
 
     # -----------------------------------------------------------------------
     # REST — file browser: list workspace files for a job
@@ -305,12 +335,15 @@ def create_app(state: AppState) -> FastAPI:
                 row = conn.execute(
                     "SELECT workspace_path FROM jobs WHERE job_id = ?", (job_id,)
                 ).fetchone()
-        except sqlite3.Error:
+        except sqlite3.Error as e:
+            logger.error(f"❌ DB error listing files for {job_id[:8]}...: {e}")
             return {"error": "DB error", "files": []}
         if not row:
+            logger.warning(f"⚠️ Files request: job {job_id[:8]}... not found")
             return {"error": "Job not found", "files": []}
         ws_root = Path(row[0])
         if not ws_root.exists():
+            logger.warning(f"⚠️ Workspace {ws_root} does not exist")
             return {"error": "Workspace not found", "files": []}
         files = []
         for p in sorted(ws_root.rglob("*")):
@@ -326,6 +359,7 @@ def create_app(state: AppState) -> FastAPI:
                 "size": p.stat().st_size,
                 "is_source": p.suffix in (".py", ".js", ".ts", ".toml", ".md", ".txt", ".yaml", ".yml"),
             })
+        logger.debug(f"📂 Listed {len(files)} files from job {job_id[:8]}...")
         return {"workspace": str(ws_root), "files": files}
 
     @app.get("/api/jobs/{job_id}/files/{file_path:path}")
@@ -335,20 +369,26 @@ def create_app(state: AppState) -> FastAPI:
                 row = conn.execute(
                     "SELECT workspace_path FROM jobs WHERE job_id = ?", (job_id,)
                 ).fetchone()
-        except sqlite3.Error:
+        except sqlite3.Error as e:
+            logger.error(f"❌ DB error reading file {file_path}: {e}")
             return {"error": "DB error"}
         if not row:
+            logger.warning(f"⚠️ Read file request: job {job_id[:8]}... not found")
             return {"error": "Job not found"}
         ws_root = Path(row[0])
         target = (ws_root / file_path).resolve()
         # Path traversal guard
         if ws_root.resolve() not in target.parents and target != ws_root.resolve():
+            logger.warning(f"🔒 Path traversal attempt: {file_path}")
             return {"error": "Access denied"}
         if not target.exists() or not target.is_file():
+            logger.warning(f"⚠️ File not found: {file_path}")
             return {"error": "File not found"}
         try:
             content = target.read_text(encoding="utf-8", errors="replace")
+            logger.debug(f"📄 Read file {file_path} ({target.stat().st_size} bytes)")
         except Exception as exc:
+            logger.error(f"❌ Failed to read file {file_path}: {exc}")
             return {"error": str(exc)}
         return {"path": file_path, "content": content, "size": target.stat().st_size}
 
@@ -383,8 +423,9 @@ _HTML = r"""<!DOCTYPE html>
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
   header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   header h1 { font-size: 15px; font-weight: 600; color: var(--accent); white-space: nowrap; }
-  #goal-input { flex: 1; min-width: 200px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 6px 10px; font-size: 13px; }
+  #goal-input { flex: 2; min-width: 240px; max-width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-size: 13px; line-height: 1.4; height: 64px; resize: vertical; }
   #goal-input:focus { outline: none; border-color: var(--accent); }
+  #goal-file-input { background: transparent; color: var(--text); }
   button { border: none; border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer; font-weight: 500; }
   #start-btn { background: var(--green); color: #000; }
   #start-btn:disabled { background: #2d4a35; color: var(--muted); cursor: not-allowed; }
@@ -425,10 +466,19 @@ _HTML = r"""<!DOCTYPE html>
   .state-failed { color: var(--red); }
   .state-running, .state-submitted { color: var(--orange); }
   /* Tasks table */
-  #tasks-section { flex-shrink: 0; max-height: 200px; border-bottom: 1px solid var(--border); overflow-y: auto; }
-  .task-row { display: grid; grid-template-columns: 1fr 80px 80px; gap: 4px; padding: 4px 12px; border-bottom: 1px solid #1c2128; font-size: 11px; font-family: monospace; }
-  /* Log */
-  #log { flex: 1; overflow-y: auto; padding: 8px 12px; font-family: "SF Mono", "Fira Code", monospace; font-size: 11px; line-height: 1.6; }
+  #tasks-section { flex-shrink: 0; max-height: 100%; overflow-y: auto; }
+  .task-row { display: grid; grid-template-columns: 28px 1fr 90px 90px; gap: 6px; padding: 6px 12px; border-bottom: 1px solid #1c2128; font-size: 11px; font-family: monospace; align-items: center; }
+  .task-checkbox { width: 16px; height: 16px; margin: 0; }
+  .task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-state.pending { color: var(--muted); }
+  .task-state.running { color: var(--orange); }
+  .task-state.completed { color: var(--green); }
+  .task-state.failed { color: var(--red); }
+  .task-state.blocked { color: #999; }
+  .task-state.cancelled { color: #999; }
+  .task-row:hover .task-title { color: var(--text); }
+  .task-row-title { font-weight: 500; }
+  #log { display: none; }
   .log-line { white-space: pre-wrap; word-break: break-all; }
   .log-info { color: var(--accent); }
   .log-success { color: var(--green); }
@@ -475,7 +525,8 @@ _HTML = r"""<!DOCTYPE html>
 _HTML += r"""
 <header>
   <h1>⚡ Ollama Fleet</h1>
-  <input id="goal-input" type="text" placeholder="Enter project goal…" value="">
+  <textarea id="goal-input" placeholder="Enter project goal or upload a .txt file…"></textarea>
+  <input id="goal-file-input" type="file" accept=".txt">
   <button id="start-btn">▶ Start Job</button>
   <button id="stop-btn" disabled>⏹ Stop</button>
   <span id="status-dot"></span>
@@ -543,14 +594,13 @@ _HTML += r"""
 
   <!-- Right column -->
   <div class="right-col">
-    <div class="panel-title" style="padding:8px 12px 6px;border-bottom:1px solid var(--border);background:var(--surface)">Task Progress</div>
+    <div class="panel-title" style="padding:8px 12px 6px;border-bottom:1px solid var(--border);background:var(--surface)">Task Checklist</div>
     <div id="tasks-section">
-      <div style="display:grid;grid-template-columns:1fr 80px 80px;gap:4px;padding:4px 12px;font-size:10px;color:var(--muted);border-bottom:1px solid var(--border)">
-        <span>Task ID</span><span>Agent</span><span>State</span>
+      <div style="display:grid;grid-template-columns:28px 1fr 90px 90px;gap:6px;padding:4px 12px;font-size:10px;color:var(--muted);border-bottom:1px solid var(--border)">
+        <span></span><span>Task</span><span>Agent</span><span>State</span>
       </div>
       <div id="tasks-list"></div>
     </div>
-    <div class="panel-title" style="padding:8px 12px 6px;border-bottom:1px solid var(--border);background:var(--surface)">Output Log</div>
     <div id="log"></div>
   </div>
 </div>
@@ -653,7 +703,15 @@ function onTaskStateChanged(ev) {
   const tid = ev.task_id || "?";
   const ns = ev.new_state || "–";
   const agent = (ev.agent_type || "?").toLowerCase();
-  state.tasks[tid] = { agent_type: agent, state: ns };
+  const prev = state.tasks[tid] || {};
+  state.tasks[tid] = {
+    title: prev.title || tid,
+    description: prev.description || "",
+    agent_type: agent,
+    state: ns,
+    priority: prev.priority,
+    dependencies: prev.dependencies || [],
+  };
   renderTasks();
   if (["planner","coder","critic","tester","synthesizer"].includes(agent)) {
     setAgent(agent, ns);
@@ -686,8 +744,19 @@ function renderTasks() {
   for (const [tid, info] of Object.entries(state.tasks)) {
     const row = document.createElement("div");
     row.className = "task-row";
-    row.innerHTML = `<span title="${tid}">${tid.slice(-20)}</span><span>${info.agent_type}</span><span class="state-${info.state}">${info.state}</span>`;
+    const checked = info.state === "completed" ? "checked" : "";
+    const title = info.title || tid;
+    const description = info.description ? `\n${info.description}` : "";
+    row.innerHTML = `
+      <input class="task-checkbox" type="checkbox" disabled ${checked}>
+      <div class="task-title" title="${escHtml(title + description)}"><span class="task-row-title">${escHtml(title)}</span>${description ? `<div style="color:var(--muted);font-size:10px;margin-top:2px;">${escHtml(info.description)}</div>` : ""}</div>
+      <span>${escHtml(info.agent_type)}</span>
+      <span class="task-state ${escHtml(info.state)}">${escHtml(info.state)}</span>
+    `;
     el.appendChild(row);
+  }
+  if (!Object.keys(state.tasks).length) {
+    el.innerHTML = '<div style="padding:10px 12px;color:var(--muted);font-size:11px">No tasks yet. Start a job to see the planner task checklist.</div>';
   }
 }
 
@@ -711,7 +780,16 @@ async function selectJob(jobId) {
   refreshJobs();
   const tasks = await fetch(`/api/jobs/${jobId}/tasks`).then(r => r.json()).catch(() => []);
   state.tasks = {};
-  for (const t of tasks) state.tasks[t.task_id] = { agent_type: t.agent_type, state: t.state };
+  for (const t of tasks) {
+    state.tasks[t.task_id] = {
+      title: t.title || t.task_id,
+      description: t.description || "",
+      agent_type: t.agent_type,
+      state: t.state,
+      priority: t.priority,
+      dependencies: t.dependencies || [],
+    };
+  }
   renderTasks();
   refreshFileBrowser(jobId);
 }
@@ -720,10 +798,14 @@ async function selectJob(jobId) {
 async function refreshFileBrowser(jobId) {
   const el = document.getElementById("file-list");
   el.innerHTML = '<div style="padding:4px 12px;color:var(--muted);font-size:11px">Loading…</div>';
+  console.log(`📂 Loading files for job ${jobId}`);
   const data = await fetch(`/api/jobs/${jobId}/files`).then(r => r.json()).catch(() => ({ files: [], error: "fetch failed" }));
+  console.log(`✅ Files fetched:`, data);
+  
   el.innerHTML = "";
   if (data.error && !data.files?.length) {
     el.innerHTML = `<div style="padding:4px 12px;color:var(--muted);font-size:11px">${data.error}</div>`;
+    console.warn(`⚠️ Files error: ${data.error}`);
     return;
   }
   // Group by directory
@@ -734,6 +816,7 @@ async function refreshFileBrowser(jobId) {
     if (!byDir[dir]) byDir[dir] = [];
     byDir[dir].push(f);
   }
+  let fileCount = 0;
   for (const [dir, files] of Object.entries(byDir)) {
     if (dir) {
       const hdr = document.createElement("div");
@@ -742,6 +825,7 @@ async function refreshFileBrowser(jobId) {
       el.appendChild(hdr);
     }
     for (const f of files) {
+      fileCount++;
       const row = document.createElement("div");
       row.className = "file-entry";
       const icon = f.is_source ? "📄" : "📦";
@@ -749,11 +833,15 @@ async function refreshFileBrowser(jobId) {
       const size = f.size < 1024 ? `${f.size}B` : `${(f.size/1024).toFixed(1)}K`;
       row.innerHTML = `<span class="file-icon">${icon}</span><span class="file-name" title="${f.path}">${name}</span><span class="file-size">${size}</span>`;
       if (f.is_source) {
-        row.onclick = () => openFile(jobId, f.path);
+        row.onclick = () => {
+          console.log(`🔗 File clicked: ${f.path}`);
+          openFile(jobId, f.path);
+        };
       }
       el.appendChild(row);
     }
   }
+  console.log(`📋 Rendered ${fileCount} files from job ${jobId}`);
   if (!data.files?.length) {
     el.innerHTML = '<div style="padding:4px 12px;color:var(--muted);font-size:11px">No files yet</div>';
   }
@@ -766,9 +854,36 @@ async function openFile(jobId, filePath) {
   title.textContent = filePath;
   content.textContent = "Loading…";
   modal.classList.add("open");
+  
+  console.log(`📂 Opening file: jobId=${jobId}, filePath=${filePath}`);
   const encodedPath = encodeURI(filePath);
-  const data = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/files/${encodedPath}`).then(r => r.json()).catch(() => ({ error: "fetch failed" }));
-  content.textContent = data.error ? `Error: ${data.error}` : (data.content || "(empty)");
+  const url = `/api/jobs/${encodeURIComponent(jobId)}/files/${encodedPath}`;
+  console.log(`🔗 Fetch URL: ${url}`);
+  
+  try {
+    const resp = await fetch(url);
+    console.log(`📡 Response status: ${resp.status}`);
+    
+    if (!resp.ok) {
+      content.textContent = `Error: HTTP ${resp.status} ${resp.statusText}`;
+      console.error(`❌ HTTP error: ${resp.status}`);
+      return;
+    }
+    
+    const data = await resp.json();
+    console.log(`✅ Received data:`, data);
+    
+    if (data.error) {
+      content.textContent = `Error: ${data.error}`;
+    } else if (data.content) {
+      content.textContent = data.content;
+    } else {
+      content.textContent = "(empty file)";
+    }
+  } catch (err) {
+    content.textContent = `Error: ${err.message}`;
+    console.error(`❌ Fetch error:`, err);
+  }
 }
 
 document.getElementById("file-modal-close").onclick = () => {
@@ -918,7 +1033,22 @@ document.getElementById("stop-btn").onclick = () => {
   setJobRunning(false);
 };
 document.getElementById("load-models-btn").onclick = loadModels;
-document.getElementById("goal-input").addEventListener("keydown", e => { if (e.key === "Enter") startJob(); });
+document.getElementById("goal-file-input").addEventListener("change", async (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.txt')) {
+    appendLog('Only .txt files are supported for goal uploads.', 'error');
+    return;
+  }
+  try {
+    const text = await file.text();
+    document.getElementById('goal-input').value = text.trim();
+    appendChat('System', `Loaded goal from ${file.name}`, 'system');
+  } catch (err) {
+    appendLog(`Failed to load goal file: ${err}`, 'error');
+  }
+});
+document.getElementById("goal-input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); startJob(); } });
 
 // ── Init ───────────────────────────────────────────────────────────────────
 (async () => {
