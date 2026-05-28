@@ -314,13 +314,18 @@ def create_app(state: AppState) -> FastAPI:
             return {"error": "Workspace not found", "files": []}
         files = []
         for p in sorted(ws_root.rglob("*")):
-            if p.is_file():
-                rel = str(p.relative_to(ws_root))
-                files.append({
-                    "path": rel,
-                    "size": p.stat().st_size,
-                    "is_source": p.suffix in (".py", ".js", ".ts", ".json", ".toml", ".md", ".txt", ".yaml", ".yml"),
-                })
+            if not p.is_file():
+                continue
+            rel = str(p.relative_to(ws_root))
+            if rel.startswith("agent_outputs/coder_") and rel.endswith(".json"):
+                continue
+            if rel.startswith("validation/"):
+                continue
+            files.append({
+                "path": rel,
+                "size": p.stat().st_size,
+                "is_source": p.suffix in (".py", ".js", ".ts", ".toml", ".md", ".txt", ".yaml", ".yml"),
+            })
         return {"workspace": str(ws_root), "files": files}
 
     @app.get("/api/jobs/{job_id}/files/{file_path:path}")
@@ -761,7 +766,8 @@ async function openFile(jobId, filePath) {
   title.textContent = filePath;
   content.textContent = "Loading…";
   modal.classList.add("open");
-  const data = await fetch(`/api/jobs/${jobId}/files/${filePath}`).then(r => r.json()).catch(() => ({ error: "fetch failed" }));
+  const encodedPath = encodeURI(filePath);
+  const data = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/files/${encodedPath}`).then(r => r.json()).catch(() => ({ error: "fetch failed" }));
   content.textContent = data.error ? `Error: ${data.error}` : (data.content || "(empty)");
 }
 
