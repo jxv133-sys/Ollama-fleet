@@ -45,6 +45,12 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
       "priority": 5
     }
   ],
+  "clarifying_questions": [],
+  "technical_requirements": [
+    "Use pytest for testing",
+    "Keep file paths relative",
+    "Write type hints and docstrings"
+  ],
   "milestones": [
     "Core data models and types defined",
     "Business logic implemented and tested",
@@ -68,8 +74,11 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
         "5. Include a tester task (agent_type='tester') that writes pytest tests for the core logic.\n"
         "6. End with a synthesizer task (agent_type='synthesizer') that depends on all coder/tester tasks.\n"
         "7. Synthesizer tasks MUST depend on coder tasks — never make synthesizer the first or only task.\n"
-        "8. milestones: array of plain strings describing each phase of completion.\n"
-        "9. architecture_notes: one paragraph describing the file structure, module layout, and design decisions.\n"
+        "8. clarifying_questions: array of strings. If details are missing, ask concise follow-up questions. "
+        "If no clarification is needed, return an empty list.\n"
+        "9. technical_requirements: array of strings describing exact libraries, frameworks, file structure, and quality expectations.\n"
+        "10. milestones: array of plain strings describing each phase of completion.\n"
+        "11. architecture_notes: one paragraph describing the file structure, module layout, and design decisions.\n"
         "\n=== AGENT TYPES ===\n"
         "- 'coder': writes or modifies source files\n"
         "- 'tester': writes pytest test files\n"
