@@ -330,66 +330,104 @@ def create_app(state: AppState) -> FastAPI:
     # -----------------------------------------------------------------------
     @app.get("/api/jobs/{job_id}/files")
     async def list_workspace_files(job_id: str) -> dict[str, Any]:
+        # Resolve db_path to absolute so sqlite3 finds it regardless of cwd
+        db_path = state.db_path.resolve()
+        ws_root: Path | None = None
         try:
-            with sqlite3.connect(state.db_path, timeout=2.0) as conn:
+            with sqlite3.connect(str(db_path), timeout=2.0) as conn:
                 row = conn.execute(
                     "SELECT workspace_path FROM jobs WHERE job_id = ?", (job_id,)
                 ).fetchone()
+            if row and row[0]:
+                candidate = Path(row[0])
+                if candidate.exists():
+                    ws_root = candidate
         except sqlite3.Error as e:
-            logger.error(f"❌ DB error listing files for {job_id[:8]}...: {e}")
-            return {"error": "DB error", "files": []}
-        if not row:
-            logger.warning(f"⚠️ Files request: job {job_id[:8]}... not found")
-            return {"error": "Job not found", "files": []}
-        ws_root = Path(row[0])
-        if not ws_root.exists():
-            logger.warning(f"⚠️ Workspace {ws_root} does not exist")
+            logger.error(f"DB error listing files for {job_id[:8]}: {e}")
+
+        # Fallback: scan workspaces/ directory by job_id if DB path is stale
+        if ws_root is None:
+            settings_base = Path(
+                state.orchestrator.settings.workspace.base_path
+                if state.orchestrator else "./workspaces"
+            ).resolve()
+            candidate = settings_base / job_id
+            if candidate.exists():
+                ws_root = candidate
+
+        if ws_root is None:
             return {"error": "Workspace not found", "files": []}
+
         files = []
         for p in sorted(ws_root.rglob("*")):
             if not p.is_file():
                 continue
             rel = str(p.relative_to(ws_root))
-            if rel.startswith("agent_outputs/coder_") and rel.endswith(".json"):
-                continue
-            if rel.startswith("validation/"):
+            # Skip hidden files
+            if any(part.startswith(".") for part in p.parts):
                 continue
             files.append({
                 "path": rel,
                 "size": p.stat().st_size,
-                "is_source": p.suffix in (".py", ".js", ".ts", ".toml", ".md", ".txt", ".yaml", ".yml"),
+                # All files are openable; flag source files for syntax highlighting hint
+                "is_source": True,
+                "ext": p.suffix.lstrip(".") or "txt",
             })
-        logger.debug(f"📂 Listed {len(files)} files from job {job_id[:8]}...")
         return {"workspace": str(ws_root), "files": files}
 
     @app.get("/api/jobs/{job_id}/files/{file_path:path}")
     async def read_workspace_file(job_id: str, file_path: str) -> dict[str, Any]:
+        db_path = state.db_path.resolve()
+        ws_root: Path | None = None
         try:
-            with sqlite3.connect(state.db_path, timeout=2.0) as conn:
+            with sqlite3.connect(str(db_path), timeout=2.0) as conn:
                 row = conn.execute(
                     "SELECT workspace_path FROM jobs WHERE job_id = ?", (job_id,)
                 ).fetchone()
+            if row and row[0]:
+                candidate = Path(row[0])
+                if candidate.exists():
+                    ws_root = candidate
         except sqlite3.Error as e:
-            logger.error(f"❌ DB error reading file {file_path}: {e}")
-            return {"error": "DB error"}
-        if not row:
-            logger.warning(f"⚠️ Read file request: job {job_id[:8]}... not found")
-            return {"error": "Job not found"}
-        ws_root = Path(row[0])
+            logger.error(f"DB error reading file {file_path}: {e}")
+
+        # Fallback: scan workspaces/ directory by job_id
+        if ws_root is None:
+            settings_base = Path(
+                state.orchestrator.settings.workspace.base_path
+                if state.orchestrator else "./workspaces"
+            ).resolve()
+            candidate = settings_base / job_id
+            if candidate.exists():
+                ws_root = candidate
+
+        if ws_root is None:
+            return {"error": "Workspace not found"}
+
         target = (ws_root / file_path).resolve()
         # Path traversal guard
-        if ws_root.resolve() not in target.parents and target != ws_root.resolve():
-            logger.warning(f"🔒 Path traversal attempt: {file_path}")
+        try:
+            target.relative_to(ws_root.resolve())
+        except ValueError:
             return {"error": "Access denied"}
+
         if not target.exists() or not target.is_file():
-            logger.warning(f"⚠️ File not found: {file_path}")
             return {"error": "File not found"}
+
+        # Try reading as text; fall back to showing hex for binary files
         try:
             content = target.read_text(encoding="utf-8", errors="replace")
-            logger.debug(f"📄 Read file {file_path} ({target.stat().st_size} bytes)")
+        except PermissionError:
+            # Files written by a root process — try chmod first
+            try:
+                import os as _os
+                _os.chmod(target, 0o644)
+                content = target.read_text(encoding="utf-8", errors="replace")
+            except Exception as exc:
+                return {"error": f"Permission denied: {exc}"}
         except Exception as exc:
-            logger.error(f"❌ Failed to read file {file_path}: {exc}")
             return {"error": str(exc)}
+
         return {"path": file_path, "content": content, "size": target.stat().st_size}
 
     # -----------------------------------------------------------------------
@@ -828,16 +866,14 @@ async function refreshFileBrowser(jobId) {
       fileCount++;
       const row = document.createElement("div");
       row.className = "file-entry";
-      const icon = f.is_source ? "📄" : "📦";
+      const ext = (f.path.split(".").pop() || "").toLowerCase();
+      const icon = ["py","js","ts","json","toml","md","txt","yaml","yml","sh","sql"].includes(ext) ? "📄" : "📦";
       const name = f.path.split("/").pop();
       const size = f.size < 1024 ? `${f.size}B` : `${(f.size/1024).toFixed(1)}K`;
       row.innerHTML = `<span class="file-icon">${icon}</span><span class="file-name" title="${f.path}">${name}</span><span class="file-size">${size}</span>`;
-      if (f.is_source) {
-        row.onclick = () => {
-          console.log(`🔗 File clicked: ${f.path}`);
-          openFile(jobId, f.path);
-        };
-      }
+      // ALL files are clickable
+      row.style.cursor = "pointer";
+      row.onclick = () => openFile(jobId, f.path);
       el.appendChild(row);
     }
   }

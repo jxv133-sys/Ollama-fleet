@@ -108,6 +108,11 @@ class WorkspaceManager:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(temp_file, target_path)
+            # Ensure files are world-readable regardless of umask or elevated process
+            try:
+                os.chmod(target_path, 0o644)
+            except OSError:
+                pass
         except Exception as exc:
             if temp_file is not None and temp_file.exists():
                 try:
