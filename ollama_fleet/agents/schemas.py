@@ -24,7 +24,7 @@ class PlannerTask(BaseModel):
     """A single task produced by the Planner_Agent."""
 
     task_id: str
-    step_number: int = Field(ge=1)
+    step_number: int = Field(default=0, ge=0)  # 0 = unset; normalizer fills it in
     title: str
     description: str
     # Accept both enum values and string variants
