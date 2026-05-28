@@ -258,6 +258,8 @@ class Orchestrator:
             {
                 "type": "task_state_changed",
                 "task_id": task.task_id,
+                "title": task.title,
+                "description": task.description,
                 "agent_type": task.agent_type,
                 "new_state": "running",
             }

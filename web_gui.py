@@ -742,9 +742,14 @@ function onTaskStateChanged(ev) {
   const ns = ev.new_state || "–";
   const agent = (ev.agent_type || "?").toLowerCase();
   const prev = state.tasks[tid] || {};
+  // Use title from event if provided, else keep existing, else strip UUID prefix
+  const rawTitle = ev.title || prev.title || tid;
+  const title = (rawTitle === tid)
+    ? tid.replace(/^[0-9a-f-]{36}:/, "")   // strip "uuid:" prefix → "task_012"
+    : rawTitle;
   state.tasks[tid] = {
-    title: prev.title || tid,
-    description: prev.description || "",
+    title: title,
+    description: ev.description || prev.description || "",
     agent_type: agent,
     state: ns,
     priority: prev.priority,
@@ -755,7 +760,7 @@ function onTaskStateChanged(ev) {
     setAgent(agent, ns);
     if (ns === "failed" && ev.reason) appendChat(cap(agent), `Failed: ${ev.reason}`, "error");
   }
-  appendLog(`Task ${tid.slice(-12)}: ${ns} (${agent})`, "debug");
+  appendLog(`Task ${title}: ${ns} (${agent})`, "debug");
 }
 
 function onValidation(ev) {
@@ -819,8 +824,12 @@ async function selectJob(jobId) {
   const tasks = await fetch(`/api/jobs/${jobId}/tasks`).then(r => r.json()).catch(() => []);
   state.tasks = {};
   for (const t of tasks) {
+    const rawTitle = t.title || t.task_id;
+    const title = (rawTitle === t.task_id)
+      ? t.task_id.replace(/^[0-9a-f-]{36}:/, "")
+      : rawTitle;
     state.tasks[t.task_id] = {
-      title: t.title || t.task_id,
+      title: title,
       description: t.description || "",
       agent_type: t.agent_type,
       state: t.state,
