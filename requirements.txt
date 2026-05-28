@@ -1,0 +1,10 @@
+httpx[http2]
+aiosqlite
+pydantic>=2.0
+textual>=0.20.0
+pytest
+hypothesis
+ruff
+toml
+fastapi>=0.111
+uvicorn>=0.29

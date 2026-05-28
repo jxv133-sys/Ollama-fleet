@@ -1,10 +1,29 @@
-# Ollama-fleet-
+# Ollama Fleet
 
-This repository now includes an agent pipeline scaffold in `ollama_fleet/agents/pipeline.py`.
+Quickstart
+----------
 
-- Central prompt builder for all agent types
-- Planner asks clarifying questions, captures technical requirements, and returns numbered task list
-- Coding stage executes tasks one at a time in step order
-- Scoring stage runs critic and tester agents after coding
-- Response validation against Pydantic agent schemas
-- End-to-end runner with `AgentPipeline.run_agent()`
+1. Create a virtual environment and install dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2. Run the demo (no Ollama server required):
+
+```bash
+PYTHONPATH=. python3 -m ollama_fleet.main --goal "Demo run" --demo
+```
+
+3. Run the demo with GUI (optional):
+
+```bash
+pip install textual
+PYTHONPATH=. python3 -m ollama_fleet.main --goal "Demo run" --demo --ui
+```
+
+4. To use a real Ollama server, create `config.toml` with your `base_url` and run without `--demo`.
+
+More details: see `.kiro/specs/ollama-fleet/tasks.md` for the implementation plan.

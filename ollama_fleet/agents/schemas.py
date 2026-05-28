@@ -17,6 +17,9 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 
+
+from typing import Union
+
 class PlannerTask(BaseModel):
     """A single task produced by the Planner_Agent."""
 
@@ -24,9 +27,28 @@ class PlannerTask(BaseModel):
     step_number: int = Field(ge=1)
     title: str
     description: str
-    agent_type: Literal["coder", "tester", "synthesizer"]
+    # Accept both enum values and string variants
+    agent_type: Union[Literal["coder", "tester", "synthesizer"], str]
     dependencies: list[str] = []
-    priority: int = Field(ge=1, le=10)
+    # Accept int or string for priority, with default
+    priority: Union[int, str] = Field(default=5)
+    
+    @classmethod
+    def model_validate(cls, data):
+        """Normalize task before validation."""
+        if isinstance(data.get("priority"), str):
+            try:
+                data["priority"] = int(data["priority"])
+            except (ValueError, TypeError):
+                data["priority"] = 5
+        
+        # Normalize agent_type: remove _agent suffix if present
+        if "agent_type" in data and isinstance(data["agent_type"], str):
+            val = data["agent_type"].lower()
+            if val.endswith("_agent"):
+                data["agent_type"] = val.replace("_agent", "")
+        
+        return super().model_validate(data)
 
 
 class PlannerOutput(BaseModel):

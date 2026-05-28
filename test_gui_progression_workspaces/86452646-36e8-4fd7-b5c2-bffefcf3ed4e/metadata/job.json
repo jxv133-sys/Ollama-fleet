@@ -1,0 +1,8 @@
+{
+  "job_id": "86452646-36e8-4fd7-b5c2-bffefcf3ed4e",
+  "goal": "Create a REST API with user and post endpoints",
+  "created_at": "2026-05-25T19:23:46.412405+00:00",
+  "config": {
+    "source": "test"
+  }
+}
