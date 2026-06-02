@@ -505,6 +505,7 @@ _HTML = r"""<!DOCTYPE html>
   .state-running, .state-submitted { color: var(--orange); }
   /* Tasks table */
   #tasks-section { flex-shrink: 0; max-height: 100%; overflow-y: auto; }
+  #tasks-section.collapsed { display: none; }
   .task-row { display: grid; grid-template-columns: 28px 1fr 90px 90px; gap: 6px; padding: 6px 12px; border-bottom: 1px solid #1c2128; font-size: 11px; font-family: monospace; align-items: center; }
   .task-checkbox { width: 16px; height: 16px; margin: 0; }
   .task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -629,7 +630,10 @@ _HTML += r"""
 
   <!-- Right column -->
   <div class="right-col">
-    <div class="panel-title" style="padding:8px 12px 6px;border-bottom:1px solid var(--border);background:var(--surface)">Task Checklist</div>
+    <div class="panel-title" style="padding:8px 12px 6px;border-bottom:1px solid var(--border);background:var(--surface);display:flex;align-items:center;justify-content:space-between;">
+      <span>Task Checklist</span>
+      <button id="tasks-collapse-btn" onclick="toggleTasksSection()" style="background:none;border:1px solid var(--border);color:var(--muted);font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;">▲ collapse</button>
+    </div>
     <div id="tasks-section">
       <div style="display:grid;grid-template-columns:28px 1fr 90px 90px;gap:6px;padding:4px 12px;font-size:10px;color:var(--muted);border-bottom:1px solid var(--border)">
         <span></span><span>Task</span><span>Agent</span><span>State</span>
@@ -642,7 +646,7 @@ _HTML += r"""
         <div id="ai-summary-meta" style="color:var(--muted);font-size:11px">📊 Iterations: 0 | 🧪 Tests: pending</div>
       </div>
       <div id="ai-summary-content" style="flex:1;overflow-y:auto;padding:12px;font-family:SF Mono,monospace;font-size:11px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;color:var(--text)">
-        <div style="color:var(--muted);text-align:center;padding:20px">Waiting for agents to start working...</div>
+        <div data-placeholder style="color:var(--muted);text-align:center;padding:20px">Waiting for agents to start working...</div>
       </div>
     </div>
     <div id="log"></div>
@@ -701,14 +705,19 @@ function handleEvent(ev) {
   else if (t === "agent_log")      onAgentLog(ev);
   else if (t === "agent_output")   onAgentOutput(ev);
   else if (t === "agent_progress") onAgentProgress(ev);
+  else if (t === "prompt_sent")    onPromptSent(ev);
   else if (t === "task_state_changed") onTaskStateChanged(ev);
   else if (t === "file_written") {
     appendLog(`File created: ${ev.path}`, "success");
+    appendChat("System", `📄 File written: ${ev.path}`, "system");
     addFileChange(ev.path);
     if (state.selectedJobId) refreshFileBrowser(state.selectedJobId);
   }
   else if (t === "validation_result") onValidation(ev);
-  else if (t === "escalation_added")  appendLog(`⚠ ESCALATION: ${ev.escalation?.reason}`, "warning");
+  else if (t === "escalation_added") {
+    appendLog(`⚠ ESCALATION: ${ev.escalation?.reason}`, "warning");
+    appendChat("System", `⚠ Escalation: ${ev.escalation?.reason || "unknown"}`, "error");
+  }
 }
 
 function onJobStateChanged(ev) {
@@ -748,13 +757,11 @@ function onAgentOutput(ev) {
   const text = typeof out === "object" ? JSON.stringify(out) : String(out);
   appendLog(`[${agent.toUpperCase()}] ${text}`, agent);
 
-  const prompt = out.prompt || ev.prompt || "";
   const response = formatAgentMsg(out);
-  
+
   // Store interaction in state
   state.interactions.push({
     agent: cap(agent),
-    prompt: prompt || "(no prompt)",
     response: response
   });
 
@@ -765,6 +772,8 @@ function onAgentOutput(ev) {
     setAgent(agent, "completed");
     state.iterations += 1;
     showLoading(false);
+    // Append to chat timeline
+    appendChat(cap(agent), response, agent);
     updateSummaryPanel();
   }
 
@@ -772,7 +781,7 @@ function onAgentOutput(ev) {
     addFileChange(out.file_path);
   }
   if (Array.isArray(out.files_created)) {
-    out.files_created.forEach(addFileChange);
+    out.files_created.forEach(f => { addFileChange(f); appendChat("System", `📄 File written: ${f}`, "system"); });
   }
   if (typeof out.tests_passed !== "undefined") {
     state.testStatus = out.tests_failed ? `Failed (${out.tests_failed} failed)` : `Passed (${out.tests_passed} passed)`;
@@ -795,6 +804,56 @@ function onAgentProgress(ev) {
   };
   showLoading(false);
   updateSummaryPanel();
+}
+
+function onPromptSent(ev) {
+  const agent = (ev.agent_type || "?").toLowerCase();
+  const prompt = ev.prompt || "";
+  if (!prompt) return;
+
+  // Show the prompt in the chat panel as a collapsible block
+  const chat = document.getElementById("chat");
+  if (!chat) return;
+
+  const msgEl = document.createElement("div");
+  msgEl.className = "chat-msg";
+
+  const header = document.createElement("div");
+  header.style.cssText = "display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;";
+
+  const speaker = document.createElement("span");
+  speaker.className = `chat-speaker speaker-${agent}`;
+  speaker.textContent = cap(agent);
+
+  const label = document.createElement("span");
+  label.style.cssText = "color:var(--muted);font-size:11px;";
+  label.textContent = "→ prompt";
+
+  const toggle = document.createElement("span");
+  toggle.style.cssText = "color:var(--muted);font-size:10px;margin-left:auto;";
+  toggle.textContent = "▼ show";
+
+  header.appendChild(speaker);
+  header.appendChild(label);
+  header.appendChild(toggle);
+
+  const body = document.createElement("pre");
+  body.style.cssText = "display:none;margin-top:4px;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:300px;overflow-y:auto;";
+  body.textContent = prompt;
+
+  header.addEventListener("click", () => {
+    const open = body.style.display !== "none";
+    body.style.display = open ? "none" : "block";
+    toggle.textContent = open ? "▼ show" : "▲ hide";
+  });
+
+  msgEl.appendChild(header);
+  msgEl.appendChild(body);
+  chat.appendChild(msgEl);
+  chat.scrollTop = chat.scrollHeight;
+
+  // Also log a one-liner to the log panel
+  appendLog(`[${agent.toUpperCase()}] prompt sent (${prompt.length} chars)`, "debug");
 }
 
 function onTaskStateChanged(ev) {
@@ -900,6 +959,7 @@ function onValidation(ev) {
   state.testStatus = ok ? "Validation OK" : "Syntax error";
   updateSummaryPanel();
   appendLog(`Validation ${ok ? "✓ syntax ok" : "✗ syntax error"}`, ok ? "success" : "warning");
+  if (!ok) appendChat("System", "✗ Syntax error detected — coder will retry", "error");
 }
 
 // ── Agent status helpers ───────────────────────────────────────────────────
@@ -1169,57 +1229,72 @@ function addFileChange(path) {
 
 function updateSummaryPanel() {
   const meta = document.getElementById('ai-summary-meta');
-  const content = document.getElementById('ai-summary-content');
   if (meta) {
     meta.innerHTML = `📊 Iterations: ${state.iterations} | 🧪 Tests: ${state.testStatus}`;
   }
-  if (content) {
-    let html = '';
+  // Live response banner — update in-place, don't rebuild full chat
+  let liveEl = document.getElementById('live-response-banner');
+  const content = document.getElementById('ai-summary-content');
+  if (!content) return;
 
-    // Live response (real-time)
-    if (state.liveResponse) {
-      const agent = state.liveResponse.agent;
-      const agentColor = getAgentColor(agent);
-      html += `<div style="margin-bottom:12px;padding:8px;border-left:3px solid ${agentColor};background:#1c2128;border-radius:4px;">
-        <div style="color:${agentColor};font-weight:600;margin-bottom:4px">🔴 ${agent} (live)</div>
-        <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Request in progress...</div>
-        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;opacity:0.9">${escHtml(state.liveResponse.response.slice(0, 300))}</div>
-      </div>`;
+  if (state.liveResponse) {
+    const agent = state.liveResponse.agent;
+    const agentColor = getAgentColor(agent);
+    if (!liveEl) {
+      liveEl = document.createElement('div');
+      liveEl.id = 'live-response-banner';
+      liveEl.style.cssText = `margin-bottom:8px;padding:8px;border-left:3px solid ${agentColor};background:#1c2128;border-radius:4px;`;
+      content.appendChild(liveEl);
+      if (_isScrolledToBottom(content)) content.scrollTop = content.scrollHeight;
     }
-
-    // Files created
-    if (state.fileChanges.length > 0) {
-      html += `<div style="margin-bottom:12px;padding:8px;background:#1c2128;border-radius:4px;border-left:3px solid var(--green)">
-        <div style="color:var(--green);font-weight:600;margin-bottom:6px">✓ Files Created (${state.fileChanges.length})</div>
-        ${state.fileChanges.map(f => `<div style="color:var(--text);margin:3px 0">  📄 ${escHtml(f)}</div>`).join('')}
-      </div>`;
-    }
-
-    // Completed agent outputs (reverse order - latest first)
-    if (state.interactions.length > 0) {
-      html += `<div style="margin-bottom:12px;border-top:1px solid var(--border);padding-top:8px">
-        <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Agent Outputs</div>`;
-
-      for (let i = state.interactions.length - 1; i >= Math.max(0, state.interactions.length - 5); i--) {
-        const inter = state.interactions[i];
-        const agentColor = getAgentColor(inter.agent);
-        html += `<div style="margin-bottom:10px;padding:8px;background:#1c2128;border-radius:4px;border-left:3px solid ${agentColor}">
-          <div style="color:${agentColor};font-weight:600;font-size:12px;margin-bottom:4px">✓ ${inter.agent}</div>
-          <div style="color:var(--text);font-size:11px;white-space:pre-wrap;word-break:break-word;opacity:0.9">${escHtml(inter.response.slice(0, 200))}</div>
-        </div>`;
-      }
-      html += '</div>';
-    }
-
-    // Empty state
-    if (!state.liveResponse && state.fileChanges.length === 0 && state.interactions.length === 0) {
-      html = '<div style="color:var(--muted);text-align:center;padding:20px">⏳ Waiting for agents to start working...</div>';
-    }
-
-    content.innerHTML = html;
-    // Auto-scroll to bottom
-    content.scrollTop = content.scrollHeight;
+    liveEl.style.borderLeftColor = agentColor;
+    liveEl.innerHTML = `<div style="color:${agentColor};font-weight:600;margin-bottom:4px">🔴 ${escHtml(agent)} (live)</div><div style="color:var(--text);white-space:pre-wrap;word-break:break-word;opacity:0.9;font-size:11px;">${escHtml(state.liveResponse.response.slice(0, 500))}</div>`;
+  } else if (liveEl) {
+    liveEl.remove();
   }
+}
+
+function _isScrolledToBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+}
+
+function appendChat(speaker, text, type) {
+  const content = document.getElementById('ai-summary-content');
+  if (!content) return;
+
+  const atBottom = _isScrolledToBottom(content);
+
+  const agentColor = getAgentColor(speaker);
+  const ts = new Date().toTimeString().slice(0, 8);
+
+  const msgEl = document.createElement('div');
+  msgEl.className = 'chat-msg';
+  msgEl.style.cssText = 'margin-bottom:10px;padding:8px 10px;background:#1c2128;border-radius:4px;border-left:3px solid ' + agentColor + ';';
+
+  const header = document.createElement('div');
+  header.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:4px;';
+  header.innerHTML = `<span style="color:${agentColor};font-weight:600;font-size:12px;">${escHtml(speaker)}</span><span style="color:var(--muted);font-size:10px;">${ts}</span>`;
+
+  const body = document.createElement('div');
+  body.style.cssText = 'color:var(--text);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.5;';
+  body.textContent = text;
+
+  msgEl.appendChild(header);
+  msgEl.appendChild(body);
+
+  // Append to bottom
+  content.appendChild(msgEl);
+
+  // Only auto-scroll if user was already at bottom
+  if (atBottom) content.scrollTop = content.scrollHeight;
+}
+
+function toggleTasksSection() {
+  const section = document.getElementById('tasks-section');
+  const btn = document.getElementById('tasks-collapse-btn');
+  if (!section || !btn) return;
+  const collapsed = section.classList.toggle('collapsed');
+  btn.textContent = collapsed ? '▼ expand' : '▲ collapse';
 }
 
 function getAgentColor(agent) {
@@ -1317,6 +1392,18 @@ async function startJob() {
   state.interactions = [];
   state.iterations = 0;
   renderTasks();
+  // Add a separator in chat for new job rather than clearing the whole timeline
+  const content = document.getElementById('ai-summary-content');
+  if (content) {
+    // Remove placeholder if present
+    const placeholder = content.querySelector('[data-placeholder]');
+    if (placeholder) placeholder.remove();
+    const sep = document.createElement('div');
+    sep.style.cssText = 'border-top:2px solid var(--border);margin:12px 0 8px;text-align:center;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;';
+    sep.textContent = `── New Job: ${goal.slice(0, 60)}${goal.length > 60 ? '…' : ''} ──`;
+    content.appendChild(sep);
+    content.scrollTop = content.scrollHeight;
+  }
   updateSummaryPanel();
   showLoading(true);
   setStatusDot("submitted");

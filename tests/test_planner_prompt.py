@@ -9,11 +9,10 @@ def test_build_planner_prompt_includes_required_format() -> None:
 
     assert prompt.startswith("You are a software project planning agent.")
     assert "Do NOT write code." in prompt
-    assert "Do NOT explain your reasoning." in prompt
-    assert "Return ONLY valid JSON." in prompt
-    assert "Response format:" in prompt
+    assert "Do NOT use JSON" in prompt
+    assert "numbered list" in prompt.lower()
     assert "Goal: Build an API server" in prompt
-    assert "Create one task per file." in prompt or "Create one task per file" in prompt
+    assert "One task per file" in prompt or "one task per file" in prompt.lower()
 
 
 def test_normalize_planner_output_adds_missing_optional_lists() -> None:

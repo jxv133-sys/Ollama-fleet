@@ -61,6 +61,7 @@ class OllamaClient:
         prompt: str,
         timeout: float,
         on_stream_update: Callable[[str, bool], Any] | None = None,
+        response_format: str | None = "json",
     ) -> str:
         """Send a generation request and return the accumulated response text.
 
@@ -85,7 +86,9 @@ class OllamaClient:
             OllamaTimeoutError: If the per-request timeout is exceeded.
         """
         url = f"{self.base_url}/api/generate"
-        payload = {"model": model, "prompt": prompt, "format": "json"}
+        payload: dict[str, Any] = {"model": model, "prompt": prompt}
+        if response_format:
+            payload["format"] = response_format
 
         try:
             timeout_config = httpx.Timeout(timeout, connect=10.0, read=timeout, write=timeout, pool=timeout)

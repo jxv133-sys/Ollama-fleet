@@ -391,6 +391,7 @@ class Orchestrator:
                 mapped_dependency
                 for dependency in task.dependencies
                 if (mapped_dependency := canonical_task_id.get(dependency, dependency)) in resolved_task_ids
+                and mapped_dependency != resolved_task_id  # strip self-references
             ]
             state = "pending" if not dependencies else "blocked"
             # If planner provided a specific file_path for this task, embed
@@ -623,6 +624,20 @@ class Orchestrator:
         )
 
         if not validation_result.syntax_ok:
+            # Inject syntax errors as critic issues so the coder sees them on retry
+            syntax_issues = [
+                {
+                    "file_path": err.file_path,
+                    "line_number": err.line or 0,
+                    "severity": "critical",
+                    "description": f"Syntax error: {err.message}",
+                    "suggested_fix": "Fix the syntax error before anything else. Do not change any other logic.",
+                }
+                for err in validation_result.syntax_errors
+            ]
+            if syntax_issues:
+                self.revision_issues[task.task_id] = syntax_issues
+            self.previous_coder_outputs.pop(task.task_id, None)
             await self.scheduler.transition(task.task_id, "pending")
             self._publish_event(
                 {
@@ -632,6 +647,51 @@ class Orchestrator:
                     "new_state": "pending",
                 }
             )
+            return
+
+        # Minimum substance check: reject files that are clearly placeholder/empty.
+        # Count non-blank, non-comment lines as a proxy for real content.
+        content_lines = [
+            l for l in coder_output.content.splitlines()
+            if l.strip() and not l.strip().startswith("#")
+        ]
+        estimated_lines = (file_spec or {}).get("estimated_lines", 50) if isinstance(file_spec, dict) else 50
+        # Require at least 20% of estimated lines, with a hard floor of 10 lines.
+        min_lines = max(10, int(estimated_lines * 0.2))
+        if len(content_lines) < min_lines:
+            reason = (
+                f"Generated file '{rel_path}' is too short: "
+                f"{len(content_lines)} non-blank lines (expected at least {min_lines} "
+                f"based on estimated {estimated_lines} lines). "
+                "The coder returned placeholder or stub content instead of a real implementation."
+            )
+            logger.warning("Task %s: %s", task.task_id, reason)
+            self._publish_event({
+                "type": "agent_log",
+                "message": f"[CODER] {reason}",
+                "level": "warning",
+            })
+            # Inject this as a critic issue so the retry prompt includes it
+            self.revision_issues.setdefault(task.task_id, [])
+            self.revision_issues[task.task_id] = [{
+                "file_path": rel_path,
+                "line_number": 0,
+                "severity": "critical",
+                "description": reason,
+                "suggested_fix": (
+                    f"Write a complete, working implementation of '{rel_path}' "
+                    f"with all required functions, classes, and logic. "
+                    "Do NOT write stubs, placeholders, or example code."
+                ),
+            }]
+            self.previous_coder_outputs.pop(task.task_id, None)
+            await self.scheduler.transition(task.task_id, "pending")
+            self._publish_event({
+                "type": "task_state_changed",
+                "task_id": task.task_id,
+                "agent_type": task.agent_type,
+                "new_state": "pending",
+            })
             return
 
         critic_output, critic_prompt = await self.executor.execute(

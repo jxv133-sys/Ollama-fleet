@@ -7,18 +7,16 @@ Downstream components rely on these schemas for reliable, type-safe processing.
 from __future__ import annotations
 
 import enum
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
 # Planner Agent
 # ---------------------------------------------------------------------------
 
-
-
-from typing import Union, Any
 
 class PlannerTask(BaseModel):
     """A single task produced by the Planner_Agent."""
@@ -41,50 +39,66 @@ class PlannerTask(BaseModel):
     # Structured file specification with exact requirements
     # Contains: purpose, public_exports, imports, functions[], exact_content, estimated_lines
     file_spec: dict[str, Any] | None = None
-    
+
+    @model_validator(mode="before")
     @classmethod
-    def model_validate(cls, data):
-        """Normalize task before validation."""
+    def _normalise(cls, data: Any) -> Any:
+        """Normalise raw dict data before field assignment.
+
+        This runs during ALL instantiation paths (direct construction,
+        nested model validation via a parent, and explicit model_validate
+        calls), unlike a @classmethod model_validate override which Pydantic v2
+        does NOT call for nested models.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # Coerce priority to int
         if isinstance(data.get("priority"), str):
             try:
                 data["priority"] = int(data["priority"])
             except (ValueError, TypeError):
                 data["priority"] = 5
 
-        # Normalize agent_type: accept strings, first element of lists, and remove _agent suffix if present
-        if "agent_type" in data:
-            if isinstance(data["agent_type"], list):
-                data["agent_type"] = str(data["agent_type"][0]) if data["agent_type"] else "coder"
-            elif isinstance(data["agent_type"], dict):
-                data["agent_type"] = str(next(iter(data["agent_type"].values()), "coder"))
-            if isinstance(data["agent_type"], str):
-                val = data["agent_type"].lower()
-                if val.endswith("_agent"):
-                    data["agent_type"] = val.replace("_agent", "")
+        # Normalise agent_type
+        at = data.get("agent_type")
+        if isinstance(at, list):
+            at = str(at[0]) if at else "coder"
+        elif isinstance(at, dict):
+            at = str(next(iter(at.values()), "coder"))
+        if isinstance(at, str):
+            at = at.lower()
+            if at.endswith("_agent"):
+                at = at.replace("_agent", "")
+            data["agent_type"] = at
 
-        # Ensure required_contents is a list of strings when present
-        if "required_contents" in data and data["required_contents"] is not None:
-            if isinstance(data["required_contents"], str):
-                data["required_contents"] = [data["required_contents"]]
+        # Ensure required_contents is a list of strings
+        rc = data.get("required_contents")
+        if rc is not None:
+            if isinstance(rc, str):
+                data["required_contents"] = [rc]
             else:
-                data["required_contents"] = [str(x) for x in data["required_contents"]]
+                data["required_contents"] = [str(x) for x in rc]
 
-        # Handle filename field - convert to file_path with just filename (no paths)
-        if "filename" in data and data["filename"]:
-            from pathlib import Path
-            filename = str(data["filename"])
-            # Strip any path components, just keep the filename
-            filename = Path(filename).name
-            data["file_path"] = filename
-            del data["filename"]
-        elif "file_path" in data and data["file_path"]:
-            from pathlib import Path
-            # Normalize file_path to just filename for flat structure
-            file_path = str(data["file_path"])
-            filename = Path(file_path).name
-            data["file_path"] = filename
+        # filename → file_path (strip directory components for flat layout)
+        if data.get("filename"):
+            data["file_path"] = Path(str(data["filename"])).name
+            data["filename"] = None
+        elif data.get("file_path"):
+            data["file_path"] = Path(str(data["file_path"])).name
 
-        return super().model_validate(data)
+        # Inject file_path into file_spec so downstream consumers don't need
+        # to look in two places.
+        if data.get("file_path") and isinstance(data.get("file_spec"), dict):
+            if not data["file_spec"].get("file_path"):
+                data["file_spec"]["file_path"] = data["file_path"]
+
+        return data
+
+    @classmethod
+    def model_validate(cls, data, **kwargs):  # type: ignore[override]
+        """Kept for call-site compatibility; delegates to super()."""
+        return super().model_validate(data, **kwargs)
 
 
 class PlannerOutput(BaseModel):

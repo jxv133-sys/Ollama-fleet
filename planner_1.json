@@ -1,0 +1,45 @@
+{
+  "timestamp": "2026-06-02T03:28:00.477253+00:00",
+  "agent_type": "planner",
+  "prompt": "You are a software project planning agent.\n\nYour job is to break a software project into implementation tasks.\n\nCRITICAL RULES FOR DECOMPOSITION:\n1. Create one task per file. Each file is ONE module with ONE responsibility.\n2. For multi-feature goals: Create AT LEAST 3-5 separate tasks. Do NOT combine unrelated features into one file.\n3. If task A imports from file B, then task B MUST exist as a separate task.\n4. Base modules (config, utils, schemas) MUST come first with no dependencies.\n5. Dependent modules (business logic) depend on base modules.\n6. CLI/main entry point comes LAST and depends on all others.\n\nAll files go in the SAME directory. Do NOT use subdirectories or file paths.\n\nFor each file, specify EXACTLY:\n- What functions/classes it exports (with full signatures)\n- What it imports from other project files (MUST be real files being created)\n- Exact docstrings and behavior needed\n- Realistic estimated line count (10-20 for tiny, 50-100 for small, 100-200 for medium)\n\nDo NOT write code.\n\nDo NOT explain your reasoning.\n\nReturn ONLY valid JSON.\n\nResponse format:\n{\n  \"tasks\": [\n    {\n      \"task_id\": \"task_NNN\",\n      \"step_number\": 1,\n      \"title\": \"Descriptive title\",\n      \"filename\": \"just_the_filename.py\",\n      \"file_spec\": {\n        \"purpose\": \"What this file does and its role in the system\",\n        \"public_exports\": [\"function_name(param: type) -> return_type\", \"ClassName\"],\n        \"imports\": [\"from config import Config\"],\n        \"functions\": [\n          {\"name\": \"func\", \"type\": \"function\", \"params\": [\"x: type\"], \"returns\": \"type\", \"docstring\": \"what it does\"},\n          {\"name\": \"MyClass\", \"type\": \"class\", \"docstring\": \"class purpose and key methods\"}\n        ],\n        \"exact_content\": \"Precise implementation requirements. Be specific about algorithms and error handling.\",\n        \"estimated_lines\": 100\n      },\n      \"dependencies\": [\"task_001\"],\n      \"priority\": 1\n    }\n  ]\n}\n\nRULES:\n- Create one task per file.\n- Estimate lines realistically: base modules 50-150, business logic 80-150, CLI 100-200.\n- Do NOT create single file handling 4+ distinct features.\n- List COMPLETE function signatures with all parameters and return types.\n- Use exact_content to specify algorithms, error handling, edge cases.\n- Do NOT invent unnecessary files.\n- Return only JSON.\n\nGoal: Create a Python CLI tool that processes CSV files with transformations.\nInclude: data validation, column filtering, row aggregation, \noutput to multiple formats (CSV, JSON, Parquet). Implement a config \nfile system for pipeline definitions. Include comprehensive error handling \nand logging.\n",
+  "tasks_created": 4,
+  "milestones": [],
+  "architecture_notes": "",
+  "tasks": [
+    {
+      "task_id": "98282b96-51e2-4466-87ce-fa800a079af7:task_001",
+      "title": "Base Module: data_validation.py",
+      "description": "Base Module: data_validation.py\n\n__FILE_METADATA__:{\"purpose\": \"Data validation module containing functions for checking CSV file formats and performing basic filtering.\", \"public_exports\": [\"function_name(param: type) -> bool\"], \"imports\": [\"config import config\"], \"functions\": [{\"name\": \"validate_format\", \"type\": \"function\", \"params\": [], \"returns\": \"bool\"}, {\"name\": \"check_column_types\", \"type\": \"function\", \"params\": [\"column_name: type\"], \"returns\": \"bool\"}], \"exact_content\": \"Precise implementation of data validation logic. Check CSV file formats and ensure column types are correct.\", \"estimated_lines\": 150}",
+      "agent_type": "coder",
+      "dependencies": [],
+      "priority": 1
+    },
+    {
+      "task_id": "98282b96-51e2-4466-87ce-fa800a079af7:task_002",
+      "title": "Base Module: data_types.py",
+      "description": "Base Module: data_types.py\n\n__FILE_METADATA__:{\"purpose\": \"Data type definitions for the pipeline.\", \"public_exports\": [\"function_name(param: type) -> type\"], \"imports\": [\"config import config\"], \"functions\": [{\"name\": \"get_column_type\", \"type\": \"function\", \"params\": [\"column_name: str\"], \"returns\": \"type\"}, {\"name\": \"process_row\", \"type\": \"function\", \"params\": [\"row: dict\"], \"returns\": \"dict\"}], \"exact_content\": \"Precise implementation of data type definitions. Define column types and process rows.\", \"estimated_lines\": 80}",
+      "agent_type": "coder",
+      "dependencies": [],
+      "priority": 1
+    },
+    {
+      "task_id": "98282b96-51e2-4466-87ce-fa800a079af7:task_003",
+      "title": "Business Logic: data_transform.py",
+      "description": "Business Logic: data_transform.py\n\n__FILE_METADATA__:{\"purpose\": \"Data transformation functions for processing CSV files.\", \"public_exports\": [\"function_name(param: type) -> return_type\"], \"imports\": [\"base_module import base_module\", \"config import config\"], \"functions\": [{\"name\": \"load_data\", \"type\": \"function\", \"params\": [], \"returns\": \"list\"}, {\"name\": \"process_data\", \"type\": \"function\", \"params\": [\"data: list\"], \"returns\": \"dict\"}], \"exact_content\": \"Precise implementation of data transformation logic. Transform data and process it for output.\", \"estimated_lines\": 100}",
+      "agent_type": "coder",
+      "dependencies": [
+        "98282b96-51e2-4466-87ce-fa800a079af7:task_001",
+        "98282b96-51e2-4466-87ce-fa800a079af7:task_002"
+      ],
+      "priority": 2
+    },
+    {
+      "task_id": "98282b96-51e2-4466-87ce-fa800a079af7:task_004",
+      "title": "CLI: main.py",
+      "description": "CLI: main.py\n\n__FILE_METADATA__:{\"purpose\": \"Main CLI entry point for the pipeline.\", \"public_exports\": [], \"imports\": [\"config import config\"], \"functions\": [{\"name\": \"run_pipeline\", \"type\": \"function\", \"params\": [], \"returns\": \"str\"}], \"exact_content\": \"Precise implementation of main logic. Run pipeline and output results.\", \"estimated_lines\": 200}",
+      "agent_type": "coder",
+      "dependencies": [],
+      "priority": 3
+    }
+  ]
+}

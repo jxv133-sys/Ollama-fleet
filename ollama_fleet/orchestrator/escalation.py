@@ -77,6 +77,11 @@ class EscalationManager:
             os.fsync(temp_file.fileno())
             temp_file.close()
             os.replace(str(temp_file.name), str(target))
+            # Ensure the file is readable regardless of umask or elevated process
+            try:
+                os.chmod(target, 0o644)
+            except OSError:
+                pass
         except (OSError, IOError) as exc:
             if temp_file is not None:
                 try:

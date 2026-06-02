@@ -60,9 +60,20 @@ class WorkspaceManager:
             raise WorkspaceCreationError(
                 f"Workspace for job_id '{job_id}' already exists"
             ) from exc
+        # Ensure the workspace is readable/writable by the current user even
+        # when the process is running as root (e.g. via sudo or Docker).
+        try:
+            os.chmod(root, 0o755)
+        except OSError:
+            pass
         manager = cls(root)
         for name in cls.SUBDIRS:
-            (root / name).mkdir(parents=True, exist_ok=True)
+            subdir = root / name
+            subdir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(subdir, 0o755)
+            except OSError:
+                pass
 
         metadata = {
             "job_id": job_id,

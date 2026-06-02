@@ -34,6 +34,11 @@ class ValidationResult:
     lint_results: list[LintIssue]
     linter_available: bool
     timestamp: str
+    syntax_errors: list[SyntaxValidationError] = None
+
+    def __post_init__(self):
+        if self.syntax_errors is None:
+            self.syntax_errors = []
 
 
 class ValidationLayer:
@@ -104,6 +109,7 @@ class ValidationLayer:
             lint_results=lint_results,
             linter_available=linter_available,
             timestamp=timestamp,
+            syntax_errors=syntax_errors,
         )
         self._write_result(workspace, result, syntax_errors)
         return result

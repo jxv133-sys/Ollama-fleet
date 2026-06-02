@@ -242,6 +242,25 @@ class OllamaFleetDashboard(App):
             msg = event.get("message", "")
             self.raw_output.write_line(msg)
 
+        elif t == "prompt_sent":
+            agent = event.get("agent_type", "?").upper()
+            prompt = event.get("prompt", "")
+            # Show a header line + the full prompt in the log
+            self.raw_output.write_line(f"[bold cyan]── {agent} PROMPT ──[/bold cyan]")
+            for line in prompt.splitlines():
+                self.raw_output.write_line(f"[cyan]{line}[/cyan]")
+            self.raw_output.write_line(f"[bold cyan]── END PROMPT ──[/bold cyan]")
+
+        elif t == "agent_progress":
+            # Only log the final completed response, not every streaming chunk
+            if event.get("done"):
+                agent = event.get("agent_type", "?").upper()
+                partial = event.get("partial", "")
+                self.raw_output.write_line(f"[bold yellow]── {agent} RESPONSE ──[/bold yellow]")
+                for line in partial.splitlines():
+                    self.raw_output.write_line(f"[yellow]{line}[/yellow]")
+                self.raw_output.write_line(f"[bold yellow]── END RESPONSE ──[/bold yellow]")
+
         elif t == "agent_output":
             agent = event.get("agent_type", "?")
             output = event.get("output", "")

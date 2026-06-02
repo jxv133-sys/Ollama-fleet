@@ -30,6 +30,12 @@ def build_coder_prompt(
         "",
     ]
 
+    if file_path:
+        lines.extend([f"FILE TO WRITE: {file_path}", ""])
+
+    if task_description:
+        lines.extend(["TASK:", task_description, ""])
+
     if purpose:
         lines.extend(["PURPOSE:", purpose, ""])
 
