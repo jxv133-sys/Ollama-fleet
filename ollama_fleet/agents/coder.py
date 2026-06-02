@@ -21,74 +21,66 @@ def build_coder_prompt(
   critic_issues: list[dict[str, Any]] | None = None,
 ) -> str:
     lines = [
-        "You are a File Generation Agent.",
+        "You are a Python File Generator.",
         "",
-        "Your only responsibility is generating the complete contents of a single file.",
-        "Return only the file contents.",
-        "Do not explain your work.",
-        "Do not generate markdown.",
-        "Do not generate code fences.",
-        "Do not generate JSON.",
+        "Your job: write the complete contents of ONE file.",
+        "All files are in the same directory.",
         "",
-        "Generate a complete implementation that satisfies the provided specification.",
-        "",
-        "TARGET FILE:",
-        file_path or "(unspecified)",
+        "Output ONLY file contents. No explanations, markdown, code fences, or JSON.",
         "",
     ]
+
     if purpose:
         lines.extend(["PURPOSE:", purpose, ""])
-    if imports:
-        lines.append("REQUIRED IMPORTS:")
-        lines.extend([f"- {imp}" for imp in imports])
-        lines.append("")
+
     if required_functions:
-        lines.append("REQUIRED FUNCTIONS:")
+        lines.append("FUNCTIONS TO IMPLEMENT:")
         lines.extend([f"- {fn}" for fn in required_functions])
         lines.append("")
-    if required_behavior:
-        lines.append("REQUIRED BEHAVIOR:")
-        lines.extend([f"- {behavior}" for behavior in required_behavior])
+
+    if imports:
+        lines.append("IMPORTS NEEDED:")
+        lines.extend([f"- {imp}" for imp in imports])
         lines.append("")
-    if forbidden_behavior:
-        lines.append("FORBIDDEN BEHAVIOR:")
-        lines.extend([f"- {behavior}" for behavior in forbidden_behavior])
-        lines.append("")
+
     if required_contents:
-        lines.append("REQUIRED SYMBOLS:")
+        lines.append("PUBLIC EXPORTS:")
         lines.extend([f"- {symbol}" for symbol in required_contents])
         lines.append("")
-    if goal:
-        lines.extend(["GOAL:", goal, ""])
-    if task_description:
-        lines.extend(["TASK DESCRIPTION:", task_description, ""])
-    if active_files:
-        lines.append("ACTIVE FILES:")
-        lines.extend([f"- {path}" for path in active_files])
+
+    if required_behavior:
+        lines.append("EXACT REQUIREMENTS:")
+        lines.extend([f"- {behavior}" for behavior in required_behavior])
         lines.append("")
+
     if episodic_summaries:
-        lines.append("CONTEXT:")
+        lines.append("CONTEXT FROM PREVIOUS FILES:")
         lines.extend([f"- {summary}" for summary in episodic_summaries])
         lines.append("")
+
+    if active_files:
+        lines.append("OTHER FILES IN PROJECT:")
+        lines.extend([f"- {path}" for path in active_files])
+        lines.append("")
+
     if critic_issues:
-        lines.append("CRITIC ISSUES:")
+        lines.append("FIX THESE ISSUES:")
         for issue in critic_issues:
             lines.append(
-                f"- file_path={issue.get('file_path', '')}, line_number={issue.get('line_number', '')}, "
-                f"severity={issue.get('severity', '')}, description={issue.get('description', '')}"
+                f"- Line {issue.get('line_number', '?')}: {issue.get('description', '')} "
+                f"(severity: {issue.get('severity', 'unknown')})"
             )
         lines.append("")
-        lines.append(
-            "Regenerate the entire file content to resolve the critic issues. "
-            "Do not output patch diffs or partial edits."
-        )
+        lines.append("Regenerate the entire file to fix all issues.")
+
     lines.extend([
         "",
-        "REMEMBER:",
-        "- Return only the contents of the requested file.",
-        "- Do not include markdown, code fences, JSON, or any explanation.",
-        "- Do not invent new public interfaces. Implement the provided specification.",
-        "- If a file is being revised, regenerate the complete file content.",
+        "RULES:",
+        "- Complete file implementation only.",
+        "- No markdown, fences, JSON, or explanation.",
+        "- All files are in the same directory (use direct imports, no paths).",
+        "- If rewriting a file, output the whole thing.",
+        "- Implement the exact specification provided.",
     ])
     return "\n".join(lines)
 

@@ -32,16 +32,14 @@ class PlannerTask(BaseModel):
     dependencies: list[str] = []
     # Accept int or string for priority, with default
     priority: Union[int, str] = Field(default=5)
-    # Optional file-level hints provided by the planner so the coder can
-    # generate a single file per task. These fields are optional and
-    # will be used by the orchestrator when present.
+    # Filename (no paths) - preferred over file_path for flat file structure
+    filename: str | None = None
+    # Optional file-level hints provided by the planner (legacy support)
     file_path: str | None = None
     required_contents: list[str] = []
     estimated_size: str | None = None
-    # Optional structured file specification produced by the Planner.
-    # When present, this should be a dict describing the intended file
-    # interface and required behavior so the Coding Agent only implements
-    # the specified contract and makes no architectural decisions.
+    # Structured file specification with exact requirements
+    # Contains: purpose, public_exports, imports, functions[], exact_content, estimated_lines
     file_spec: dict[str, Any] | None = None
     
     @classmethod
@@ -52,7 +50,7 @@ class PlannerTask(BaseModel):
                 data["priority"] = int(data["priority"])
             except (ValueError, TypeError):
                 data["priority"] = 5
-        
+
         # Normalize agent_type: accept strings, first element of lists, and remove _agent suffix if present
         if "agent_type" in data:
             if isinstance(data["agent_type"], list):
@@ -70,7 +68,22 @@ class PlannerTask(BaseModel):
                 data["required_contents"] = [data["required_contents"]]
             else:
                 data["required_contents"] = [str(x) for x in data["required_contents"]]
-        
+
+        # Handle filename field - convert to file_path with just filename (no paths)
+        if "filename" in data and data["filename"]:
+            from pathlib import Path
+            filename = str(data["filename"])
+            # Strip any path components, just keep the filename
+            filename = Path(filename).name
+            data["file_path"] = filename
+            del data["filename"]
+        elif "file_path" in data and data["file_path"]:
+            from pathlib import Path
+            # Normalize file_path to just filename for flat structure
+            file_path = str(data["file_path"])
+            filename = Path(file_path).name
+            data["file_path"] = filename
+
         return super().model_validate(data)
 
 

@@ -457,37 +457,47 @@ class Orchestrator:
             "active_files": active_files,
             "episodic_summaries": [],
         }
-        # If the planner embedded file-level metadata in the task description,
-        # extract it here and forward to the coder so it knows the exact file
-        # to produce and what symbols must appear.
-        file_metadata = None
+
+        # Extract file spec and metadata from task description
+        file_path = None
+        file_spec = {}
         try:
             if task.description and "__FILE_METADATA__:" in task.description:
                 marker = "__FILE_METADATA__:"
                 idx = task.description.index(marker)
                 raw = task.description[idx + len(marker):].strip()
-                file_metadata = json.loads(raw)
-                if file_metadata.get("file_path"):
-                    extra_context["file_path"] = file_metadata.get("file_path")
-                if file_metadata.get("required_contents"):
-                    extra_context["required_contents"] = file_metadata.get("required_contents")
-                if file_metadata.get("estimated_size"):
-                    extra_context["estimated_size"] = file_metadata.get("estimated_size")
-                # New structured file_spec fields
-                if file_metadata.get("imports"):
-                    extra_context["imports"] = file_metadata.get("imports")
-                if file_metadata.get("required_functions"):
-                    extra_context["required_functions"] = file_metadata.get("required_functions")
-                if file_metadata.get("required_behavior"):
-                    extra_context["required_behavior"] = file_metadata.get("required_behavior")
-                if file_metadata.get("forbidden_behavior"):
-                    extra_context["forbidden_behavior"] = file_metadata.get("forbidden_behavior")
-                if file_metadata.get("purpose"):
-                    extra_context["purpose"] = file_metadata.get("purpose")
+                metadata = json.loads(raw)
+                file_path = metadata.get("file_path")
+                file_spec = metadata.get("file_spec") or {}
         except Exception:
-            # Non-fatal: if parsing fails, ignore metadata and proceed with
-            # a general coder task.
-            file_metadata = None
+            # Non-fatal: if parsing fails, continue without metadata
+            pass
+
+        # Map file_spec to coder context
+        if file_spec:
+            if file_spec.get("purpose"):
+                extra_context["purpose"] = file_spec["purpose"]
+            if file_spec.get("public_exports"):
+                extra_context["required_contents"] = file_spec["public_exports"]
+            if file_spec.get("imports"):
+                extra_context["imports"] = file_spec["imports"]
+            if file_spec.get("functions"):
+                # Build function signatures from the functions list
+                funcs = []
+                for func in file_spec["functions"]:
+                    sig = func.get("name", "")
+                    if func.get("params"):
+                        sig += f"({', '.join(func['params'])})"
+                    else:
+                        sig += "()"
+                    if func.get("returns"):
+                        sig += f" -> {func['returns']}"
+                    funcs.append(sig)
+                if funcs:
+                    extra_context["required_functions"] = funcs
+            if file_spec.get("exact_content"):
+                extra_context["required_behavior"] = [file_spec["exact_content"]]
+
         if task.task_id in self.revision_issues:
             extra_context["critic_issues"] = self.revision_issues[task.task_id]
 
@@ -516,7 +526,7 @@ class Orchestrator:
             "agent_type": AgentType.CODER.value,
             "output": {
                 "file_count": 1 if isinstance(coder_output, CoderOutput) else 0,
-                "file_path": file_metadata.get("file_path") if file_metadata else "",
+                "file_path": file_path or "",
                 "prompt": coder_prompt,
             },
         })
@@ -533,24 +543,18 @@ class Orchestrator:
             )
             return
 
-        file_path = None
-        if file_metadata and isinstance(file_metadata, dict):
-            file_path = file_metadata.get("file_path")
         if not file_path:
-            await self.scheduler.transition(task.task_id, "failed", reason="Missing file_path metadata for coder task")
+            await self.scheduler.transition(task.task_id, "failed", reason="Missing filename from planner")
             self._publish_event(
                 {
                     "type": "task_state_changed",
                     "task_id": task.task_id,
                     "agent_type": task.agent_type,
                     "new_state": "failed",
-                    "reason": "Missing file_path metadata for coder task",
+                    "reason": "Missing filename from planner",
                 }
             )
             return
-
-        if isinstance(file_path, str) and file_path.startswith("/"):
-            file_path = str(Path(file_path).relative_to(Path(file_path).anchor))
 
         current_modifications = [(file_path, coder_output.content)]
         if self.previous_coder_outputs.get(task.task_id) == current_modifications:

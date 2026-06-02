@@ -496,7 +496,7 @@ _HTML = r"""<!DOCTYPE html>
   .agent-state { color: var(--muted); font-size: 11px; }
   /* Jobs table */
   #jobs-list { overflow-y: auto; flex: 1; }
-  .job-row { display: grid; grid-template-columns: 70px 70px 1fr 60px; gap: 4px; padding: 5px 12px; border-bottom: 1px solid #1c2128; cursor: pointer; font-size: 11px; }
+  .job-row { display: grid; grid-template-columns: 70px 70px 60px; gap: 4px; padding: 5px 12px; border-bottom: 1px solid #1c2128; cursor: pointer; font-size: 11px; }
   .job-row:hover { background: #1c2128; }
   .job-row.selected { background: #1f2d3d; }
   .job-row .state { font-weight: 600; }
@@ -616,8 +616,8 @@ _HTML += r"""
     </div>
 
     <div class="panel-title" style="margin-top:4px">Jobs</div>
-    <div style="display:grid;grid-template-columns:70px 70px 1fr 60px;gap:4px;padding:4px 12px;font-size:10px;color:var(--muted);border-bottom:1px solid var(--border)">
-      <span>ID</span><span>State</span><span>Goal</span><span>Time</span>
+    <div style="display:grid;grid-template-columns:70px 70px 60px;gap:4px;padding:4px 12px;font-size:10px;color:var(--muted);border-bottom:1px solid var(--border)">
+      <span>ID</span><span>State</span><span>Time</span>
     </div>
     <div id="jobs-list"></div>
 
@@ -636,13 +636,14 @@ _HTML += r"""
       </div>
       <div id="tasks-list"></div>
     </div>
-    <div id="ai-summary-panel" style="border-top:1px solid var(--border);padding:8px 12px;background:#0f1519;">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-        <div class="panel-title" style="margin:0;padding:0;">AI Summary</div>
-        <div id="ai-summary-meta" style="color:var(--muted);font-size:11px">Iterations: 0 | Tests: pending</div>
+    <div id="ai-summary-panel" style="border-top:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;background:#0f1519;flex:1;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);flex-shrink:0;">
+        <div class="panel-title" style="margin:0;padding:0;">Agent Output</div>
+        <div id="ai-summary-meta" style="color:var(--muted);font-size:11px">📊 Iterations: 0 | 🧪 Tests: pending</div>
       </div>
-      <div id="ai-summary-loading" style="display:none;color:var(--muted);font-style:italic;padding:8px;text-align:center;">⏳ Waiting on agent response...</div>
-      <pre id="ai-summary-content" style="background:transparent;color:var(--text);font-family:SF Mono,monospace;max-height:220px;overflow:auto;padding:8px;border-radius:6px;border:1px solid var(--border)">Files modified or created will appear here.</pre>
+      <div id="ai-summary-content" style="flex:1;overflow-y:auto;padding:12px;font-family:SF Mono,monospace;font-size:11px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;color:var(--text)">
+        <div style="color:var(--muted);text-align:center;padding:20px">Waiting for agents to start working...</div>
+      </div>
     </div>
     <div id="log"></div>
   </div>
@@ -801,11 +802,24 @@ function onTaskStateChanged(ev) {
   const ns = ev.new_state || "–";
   const agent = (ev.agent_type || "?").toLowerCase();
   const prev = state.tasks[tid] || {};
+
+  // Extract metadata if present (file_path, file_spec from description)
+  let filename = null;
+  let fileSpec = null;
+  if (ev.description && ev.description.includes("__FILE_METADATA__:")) {
+    const meta = extractFileMetadata(ev.description);
+    if (meta) {
+      filename = meta.file_path || meta.filename;
+      fileSpec = meta.file_spec;
+    }
+  }
+
   // Use title from event if provided, else keep existing, else strip UUID prefix
   const rawTitle = ev.title || prev.title || tid;
   const title = (rawTitle === tid)
     ? tid.replace(/^[0-9a-f-]{36}:/, "")   // strip "uuid:" prefix → "task_012"
     : rawTitle;
+
   state.tasks[tid] = {
     title: title,
     description: ev.description || prev.description || "",
@@ -813,13 +827,17 @@ function onTaskStateChanged(ev) {
     state: ns,
     priority: prev.priority,
     dependencies: prev.dependencies || [],
+    filename: filename || prev.filename,
+    file_spec: fileSpec || prev.file_spec,
+    step_number: ev.step_number || prev.step_number,
   };
   renderTasks();
   if (["planner","coder","critic","tester","synthesizer"].includes(agent)) {
     setAgent(agent, ns);
     if (ns === "failed" && ev.reason) appendChat(cap(agent), `Failed: ${ev.reason}`, "error");
   }
-  appendLog(`Task ${title}: ${ns} (${agent})`, "debug");
+  const filedesc = filename ? ` → ${filename}` : "";
+  appendLog(`Task ${title}: ${ns} (${agent})${filedesc}`, "debug");
 }
 
 // ── Live file polling ────────────────────────────────────────────────────
@@ -906,11 +924,14 @@ function renderTasks() {
     const rawTitle = info.title ? String(info.title).trim() : "";
     const taskTitle = rawTitle || tid;
     const stepPrefix = info.step_number ? `${info.step_number}. ` : "";
-    const title = stepPrefix + taskTitle;
+    const filename = info.filename ? ` [${info.filename}]` : "";
+    const title = stepPrefix + taskTitle + filename;
     const description = info.description ? `\n${info.description}` : "";
+    const fileSpec = info.file_spec ? `\nFile spec: ${info.file_spec.purpose || ""}` : "";
+    const tooltip = escHtml(title + description + fileSpec);
     row.innerHTML = `
       <input class="task-checkbox" type="checkbox" disabled ${checked}>
-      <div class="task-title" title="${escHtml(title + description)}"><span class="task-row-title">${escHtml(title)}</span>${description ? `<div style="color:var(--muted);font-size:10px;margin-top:2px;">${escHtml(info.description)}</div>` : ""}</div>
+      <div class="task-title" title="${tooltip}"><span class="task-row-title">${escHtml(title)}</span>${description ? `<div style="color:var(--muted);font-size:10px;margin-top:2px;">${escHtml(info.description)}</div>` : ""}${filename ? `<div style="color:var(--muted);font-size:10px;margin-top:2px;">${escHtml(filename)}</div>` : ""}</div>
       <span>${escHtml(info.agent_type)}</span>
       <span class="task-state ${escHtml(info.state)}">${escHtml(info.state)}</span>
     `;
@@ -930,7 +951,7 @@ async function refreshJobs() {
     const row = document.createElement("div");
     row.className = "job-row" + (j.job_id === state.selectedJobId ? " selected" : "");
     const ts = j.updated_at ? j.updated_at.slice(11,19) : "–";
-    row.innerHTML = `<span title="${j.job_id}">${j.job_id.slice(0,8)}</span><span class="state state-${j.state}">${j.state}</span><span title="${j.goal}">${j.goal.slice(0,30)}</span><span>${ts}</span>`;
+    row.innerHTML = `<span title="${j.job_id}">${j.job_id.slice(0,8)}</span><span class="state state-${j.state}">${j.state}</span><span>${ts}</span>`;
     row.onclick = () => selectJob(j.job_id);
     el.appendChild(row);
   }
@@ -946,6 +967,18 @@ async function selectJob(jobId) {
     const title = (rawTitle === t.task_id)
       ? t.task_id.replace(/^[0-9a-f-]{36}:/, "")
       : rawTitle;
+
+    // Extract metadata from description if present
+    let filename = null;
+    let fileSpec = null;
+    if (t.description && t.description.includes("__FILE_METADATA__:")) {
+      const meta = extractFileMetadata(t.description);
+      if (meta) {
+        filename = meta.file_path || meta.filename;
+        fileSpec = meta.file_spec;
+      }
+    }
+
     state.tasks[t.task_id] = {
       title: title,
       step_number: t.step_number || null,
@@ -954,6 +987,8 @@ async function selectJob(jobId) {
       state: t.state,
       priority: t.priority,
       dependencies: t.dependencies || [],
+      filename: filename,
+      file_spec: fileSpec,
     };
   }
   renderTasks();
@@ -1086,29 +1121,37 @@ function formatAgentMsg(out) {
     return `Tests passed: ${payload.tests_passed}, failed: ${payload.tests_failed || 0}, ready_for_review: ${payload.ready_for_review}`;
   }
   if (payload.approved !== undefined) {
-    return `Approved: ${payload.approved ? "yes" : "no"}, issues_found: ${payload.issues_found || 0}, assessment: ${payload.assessment || ""}`;
+    const issues = payload.issues ? payload.issues.length : 0;
+    return `Approved: ${payload.approved ? "yes" : "no"}, issues: ${issues}, assessment: ${payload.overall_assessment || ""}`.slice(0, 200);
   }
   if (payload.file_path) {
-    return `File: ${payload.file_path}`;
+    return `Generated: ${payload.file_path}`;
+  }
+  if (payload.file_count !== undefined) {
+    const fp = payload.file_path ? ` (${payload.file_path})` : "";
+    return `Generated ${payload.file_count} file${payload.file_count !== 1 ? "s" : ""}${fp}`;
+  }
+  if (Array.isArray(payload.files_produced) && payload.files_produced.length) {
+    return `Files created: ${payload.files_produced.slice(0,5).join(", ")}`;
   }
   if (Array.isArray(payload.files_created) && payload.files_created.length) {
     return `Files created: ${payload.files_created.slice(0,5).join(", ")}`;
-  }
-  if (payload.file_count !== undefined) {
-    return `File count: ${payload.file_count}${payload.file_path ? `, file_path: ${payload.file_path}` : ""}`;
   }
   if (payload.summary) {
     let summaryText = payload.summary;
     if (Array.isArray(payload.files_produced) && payload.files_produced.length) {
       summaryText += "\nFiles: " + payload.files_produced.slice(0,5).join(", ");
     }
-    return summaryText;
+    return summaryText.slice(0, 300);
   }
   if (payload.tasks_created !== undefined) {
-    const ms = (payload.milestones || []).slice(0,5).join(", ");
+    const ms = (payload.milestones || []).slice(0,3).join("; ");
     return `Created ${payload.tasks_created} tasks. Milestones: ${ms}`;
   }
-  return JSON.stringify(payload).slice(0,200);
+  if (payload.architecture !== undefined) {
+    return `Architecture: ${payload.architecture.slice(0, 150)}...`;
+  }
+  return JSON.stringify(payload).slice(0,150);
 }
 
 function shortPrompt(prompt) {
@@ -1128,26 +1171,66 @@ function updateSummaryPanel() {
   const meta = document.getElementById('ai-summary-meta');
   const content = document.getElementById('ai-summary-content');
   if (meta) {
-    meta.textContent = `Iterations: ${state.iterations} | Tests: ${state.testStatus}`;
+    meta.innerHTML = `📊 Iterations: ${state.iterations} | 🧪 Tests: ${state.testStatus}`;
   }
   if (content) {
-    const fileList = state.fileChanges.length ? state.fileChanges.map(path => `- ${path}`).join("\n") : "No files created or modified yet.";
-    
-    let interactionsText = "";
+    let html = '';
+
+    // Live response (real-time)
     if (state.liveResponse) {
-      const livePrompt = shortPrompt(state.liveResponse.prompt);
-      interactionsText += `\n\n=== Live response from ${state.liveResponse.agent} ===\nPrompt:\n${livePrompt}\n\n${state.liveResponse.response}\n`;
+      const agent = state.liveResponse.agent;
+      const agentColor = getAgentColor(agent);
+      html += `<div style="margin-bottom:12px;padding:8px;border-left:3px solid ${agentColor};background:#1c2128;border-radius:4px;">
+        <div style="color:${agentColor};font-weight:600;margin-bottom:4px">🔴 ${agent} (live)</div>
+        <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Request in progress...</div>
+        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;opacity:0.9">${escHtml(state.liveResponse.response.slice(0, 300))}</div>
+      </div>`;
     }
+
+    // Files created
+    if (state.fileChanges.length > 0) {
+      html += `<div style="margin-bottom:12px;padding:8px;background:#1c2128;border-radius:4px;border-left:3px solid var(--green)">
+        <div style="color:var(--green);font-weight:600;margin-bottom:6px">✓ Files Created (${state.fileChanges.length})</div>
+        ${state.fileChanges.map(f => `<div style="color:var(--text);margin:3px 0">  📄 ${escHtml(f)}</div>`).join('')}
+      </div>`;
+    }
+
+    // Completed agent outputs (reverse order - latest first)
     if (state.interactions.length > 0) {
-      interactionsText += "\n\n=== Agent Interactions ===\n";
-      state.interactions.forEach((inter, idx) => {
-        const promptShort = shortPrompt(inter.prompt);
-        interactionsText += `\n--- ${inter.agent} (${idx + 1}) ---\nPrompt:\n${promptShort}\n\nResponse:\n${inter.response}\n`;
-      });
+      html += `<div style="margin-bottom:12px;border-top:1px solid var(--border);padding-top:8px">
+        <div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">Agent Outputs</div>`;
+
+      for (let i = state.interactions.length - 1; i >= Math.max(0, state.interactions.length - 5); i--) {
+        const inter = state.interactions[i];
+        const agentColor = getAgentColor(inter.agent);
+        html += `<div style="margin-bottom:10px;padding:8px;background:#1c2128;border-radius:4px;border-left:3px solid ${agentColor}">
+          <div style="color:${agentColor};font-weight:600;font-size:12px;margin-bottom:4px">✓ ${inter.agent}</div>
+          <div style="color:var(--text);font-size:11px;white-space:pre-wrap;word-break:break-word;opacity:0.9">${escHtml(inter.response.slice(0, 200))}</div>
+        </div>`;
+      }
+      html += '</div>';
     }
-    
-    content.textContent = `Files:\n${fileList}\n\nIterations: ${state.iterations}\nTest status: ${state.testStatus}${interactionsText}`;
+
+    // Empty state
+    if (!state.liveResponse && state.fileChanges.length === 0 && state.interactions.length === 0) {
+      html = '<div style="color:var(--muted);text-align:center;padding:20px">⏳ Waiting for agents to start working...</div>';
+    }
+
+    content.innerHTML = html;
+    // Auto-scroll to bottom
+    content.scrollTop = content.scrollHeight;
   }
+}
+
+function getAgentColor(agent) {
+  const colors = {
+    'Planner': '#58a6ff',
+    'Coder': '#3fb950',
+    'Critic': '#d29922',
+    'Tester': '#f85149',
+    'Synthesizer': '#bc8cff',
+  };
+  return colors[agent] || '#8b949e';
 }
 
 function escHtml(s) {

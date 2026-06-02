@@ -153,7 +153,6 @@ def test_build_coder_prompt_includes_critic_issues() -> None:
         ],
     )
 
-    assert "CRITIC ISSUES:" in prompt
-    assert "regenerate the complete file content" in prompt
-    assert "file_path=src/app.py" in prompt
+    assert "FIX THESE ISSUES:" in prompt
+    assert "Regenerate the entire file" in prompt
 
