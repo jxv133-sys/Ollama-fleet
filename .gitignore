@@ -42,15 +42,15 @@ Thumbs.db
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
-ollama_fleet.db
 
 # Workspaces (generated during autonomous execution)
 workspaces/
 demo_workspaces/
-test_multifile_workspaces/
-test_gui_progression_workspaces/
+*_workspaces/
 
 # Test artifacts
 .pytest_cache/

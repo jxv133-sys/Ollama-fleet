@@ -1,9 +1,0 @@
-{
-  "job_id": "b0b17a72-1db1-4354-8043-a31f24a3fed2",
-  "goal": "Create a multi-file Python project with core modules",
-  "created_at": "2026-05-25T19:16:06.726568+00:00",
-  "config": {
-    "project_type": "multifile",
-    "source": "test"
-  }
-}
