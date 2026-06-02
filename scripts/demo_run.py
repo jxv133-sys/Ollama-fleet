@@ -20,7 +20,6 @@ from ollama_fleet.agents.schemas import (
     PlannerOutput,
     PlannerTask,
     CoderOutput,
-    FileModification,
     CriticOutput,
     CriticIssue,
     TesterOutput,
@@ -49,8 +48,7 @@ class DummyExecutor:
             return PlannerOutput(tasks=[t], milestones=["demo-ready"], architecture_notes="demo arch")
 
         if agent_type == AgentType.CODER:
-            fm = FileModification(file_path="src/demo.py", operation="create", content="def greet(name):\n    return f\"Hello, {name}!\"\n")
-            return CoderOutput(file_modifications=[fm], summary="Added demo.greet", confidence_score=0.95)
+            return CoderOutput(content="def greet(name):\n    return f\"Hello, {name}!\"\n")
 
         if agent_type == AgentType.CRITIC:
             # approve by default

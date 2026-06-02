@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 
 
-from typing import Union
+from typing import Union, Any
 
 class PlannerTask(BaseModel):
     """A single task produced by the Planner_Agent."""
@@ -32,6 +32,17 @@ class PlannerTask(BaseModel):
     dependencies: list[str] = []
     # Accept int or string for priority, with default
     priority: Union[int, str] = Field(default=5)
+    # Optional file-level hints provided by the planner so the coder can
+    # generate a single file per task. These fields are optional and
+    # will be used by the orchestrator when present.
+    file_path: str | None = None
+    required_contents: list[str] = []
+    estimated_size: str | None = None
+    # Optional structured file specification produced by the Planner.
+    # When present, this should be a dict describing the intended file
+    # interface and required behavior so the Coding Agent only implements
+    # the specified contract and makes no architectural decisions.
+    file_spec: dict[str, Any] | None = None
     
     @classmethod
     def model_validate(cls, data):
@@ -42,11 +53,23 @@ class PlannerTask(BaseModel):
             except (ValueError, TypeError):
                 data["priority"] = 5
         
-        # Normalize agent_type: remove _agent suffix if present
-        if "agent_type" in data and isinstance(data["agent_type"], str):
-            val = data["agent_type"].lower()
-            if val.endswith("_agent"):
-                data["agent_type"] = val.replace("_agent", "")
+        # Normalize agent_type: accept strings, first element of lists, and remove _agent suffix if present
+        if "agent_type" in data:
+            if isinstance(data["agent_type"], list):
+                data["agent_type"] = str(data["agent_type"][0]) if data["agent_type"] else "coder"
+            elif isinstance(data["agent_type"], dict):
+                data["agent_type"] = str(next(iter(data["agent_type"].values()), "coder"))
+            if isinstance(data["agent_type"], str):
+                val = data["agent_type"].lower()
+                if val.endswith("_agent"):
+                    data["agent_type"] = val.replace("_agent", "")
+
+        # Ensure required_contents is a list of strings when present
+        if "required_contents" in data and data["required_contents"] is not None:
+            if isinstance(data["required_contents"], str):
+                data["required_contents"] = [data["required_contents"]]
+            else:
+                data["required_contents"] = [str(x) for x in data["required_contents"]]
         
         return super().model_validate(data)
 
@@ -79,14 +102,30 @@ class FileModification(BaseModel):
 
 
 class CoderOutput(BaseModel):
-    """Structured output returned by the Coding_Agent.
+    """Output returned by the Coding_Agent.
 
-    Validates: Requirements 5.2
+    The Coding Agent is now responsible only for generating complete file
+    contents. Metadata such as file paths, summaries, and confidence scores
+    are managed by the orchestrator.
     """
 
-    file_modifications: list[FileModification]
-    summary: str
-    confidence_score: float = Field(ge=0.0, le=1.0)
+    content: str
+
+
+class SpecificationOutput(BaseModel):
+    """Output returned by the File Specification Agent.
+
+    This agent produces structured file requirements that the coder uses
+    to implement one complete source file.
+    """
+
+    file_path: str | None = None
+    purpose: str
+    imports: list[str] = []
+    required_functions: list[str] = []
+    required_behavior: list[str] = []
+    forbidden_behavior: list[str] = []
+    required_contents: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +202,7 @@ class SynthesizerOutput(BaseModel):
 # ---------------------------------------------------------------------------
 
 # Union of all possible agent output types.
-AgentOutput = PlannerOutput | CoderOutput | CriticOutput | TesterOutput | SynthesizerOutput
+AgentOutput = PlannerOutput | CoderOutput | SpecificationOutput | CriticOutput | TesterOutput | SynthesizerOutput
 
 
 class AgentType(str, enum.Enum):
@@ -171,6 +210,7 @@ class AgentType(str, enum.Enum):
 
     PLANNER = "planner"
     CODER = "coder"
+    SPECIFICATION = "specification"
     CRITIC = "critic"
     TESTER = "tester"
     SYNTHESIZER = "synthesizer"

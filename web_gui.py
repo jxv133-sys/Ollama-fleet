@@ -586,9 +586,6 @@ _HTML += r"""
 <div class="main">
   <!-- Left panel -->
   <div class="panel">
-    <div class="panel-title">AI Chat</div>
-    <div id="chat"></div>
-
     <div class="panel-title" style="margin-top:4px">Agent Status</div>
     <div id="agents">
       <div class="agent-row" id="agent-planner">
@@ -639,6 +636,14 @@ _HTML += r"""
       </div>
       <div id="tasks-list"></div>
     </div>
+    <div id="ai-summary-panel" style="border-top:1px solid var(--border);padding:8px 12px;background:#0f1519;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div class="panel-title" style="margin:0;padding:0;">AI Summary</div>
+        <div id="ai-summary-meta" style="color:var(--muted);font-size:11px">Iterations: 0 | Tests: pending</div>
+      </div>
+      <div id="ai-summary-loading" style="display:none;color:var(--muted);font-style:italic;padding:8px;text-align:center;">⏳ Waiting on agent response...</div>
+      <pre id="ai-summary-content" style="background:transparent;color:var(--text);font-family:SF Mono,monospace;max-height:220px;overflow:auto;padding:8px;border-radius:6px;border:1px solid var(--border)">Files modified or created will appear here.</pre>
+    </div>
     <div id="log"></div>
   </div>
 </div>
@@ -669,6 +674,11 @@ const state = {
   agents: {},      // agent_name -> {state}
   selectedJobId: null,
   availableModels: [],
+  fileChanges: [],
+  interactions: [], // [{agent, prompt, response}, ...]
+  liveResponse: null,
+  iterations: 0,
+  testStatus: 'pending',
 };
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
@@ -689,9 +699,11 @@ function handleEvent(ev) {
   if (t === "job_state_changed")   onJobStateChanged(ev);
   else if (t === "agent_log")      onAgentLog(ev);
   else if (t === "agent_output")   onAgentOutput(ev);
+  else if (t === "agent_progress") onAgentProgress(ev);
   else if (t === "task_state_changed") onTaskStateChanged(ev);
   else if (t === "file_written") {
     appendLog(`File created: ${ev.path}`, "success");
+    addFileChange(ev.path);
     if (state.selectedJobId) refreshFileBrowser(state.selectedJobId);
   }
   else if (t === "validation_result") onValidation(ev);
@@ -704,6 +716,9 @@ function onJobStateChanged(ev) {
   setStatusDot(s);
   if (["completed","failed","stopped"].includes(s)) {
     setJobRunning(false);
+    showLoading(false);
+    state.liveResponse = null;
+    updateSummaryPanel();
   }
   appendLog(`Job ${s.toUpperCase()}`, "info");
   appendChat("System", `Job ${s}`, s === "failed" ? "error" : "system");
@@ -728,13 +743,57 @@ function onAgentLog(ev) {
 
 function onAgentOutput(ev) {
   const agent = (ev.agent_type || "?").toLowerCase();
-  const out = ev.output;
+  const out = ev.output || {};
   const text = typeof out === "object" ? JSON.stringify(out) : String(out);
   appendLog(`[${agent.toUpperCase()}] ${text}`, agent);
-  appendChat(cap(agent), formatAgentMsg(out), agent);
+
+  const prompt = out.prompt || ev.prompt || "";
+  const response = formatAgentMsg(out);
+  
+  // Store interaction in state
+  state.interactions.push({
+    agent: cap(agent),
+    prompt: prompt || "(no prompt)",
+    response: response
+  });
+
   if (["planner","coder","critic","tester","synthesizer"].includes(agent)) {
+    if (state.liveResponse && state.liveResponse.agent.toLowerCase() === agent) {
+      state.liveResponse = null;
+    }
     setAgent(agent, "completed");
+    state.iterations += 1;
+    showLoading(false);
+    updateSummaryPanel();
   }
+
+  if (out.file_path) {
+    addFileChange(out.file_path);
+  }
+  if (Array.isArray(out.files_created)) {
+    out.files_created.forEach(addFileChange);
+  }
+  if (typeof out.tests_passed !== "undefined") {
+    state.testStatus = out.tests_failed ? `Failed (${out.tests_failed} failed)` : `Passed (${out.tests_passed} passed)`;
+    updateSummaryPanel();
+  }
+  if (typeof out.approved !== "undefined") {
+    state.testStatus = out.approved ? "Critic approved" : "Critic requested changes";
+    updateSummaryPanel();
+  }
+}
+
+function onAgentProgress(ev) {
+  const agent = (ev.agent_type || "?").toLowerCase();
+  const partial = String(ev.partial || "");
+  state.liveResponse = {
+    agent: cap(agent),
+    prompt: ev.prompt || "(no prompt)",
+    response: partial,
+    done: Boolean(ev.done),
+  };
+  showLoading(false);
+  updateSummaryPanel();
 }
 
 function onTaskStateChanged(ev) {
@@ -763,9 +822,65 @@ function onTaskStateChanged(ev) {
   appendLog(`Task ${title}: ${ns} (${agent})`, "debug");
 }
 
+// ── Live file polling ────────────────────────────────────────────────────
+state.currentLiveFileJob = null;
+state.currentLiveFilePath = null;
+state.liveFileTimer = null;
+
+function extractFileMetadata(desc) {
+  if (!desc) return null;
+  const marker = "__FILE_METADATA__:";
+  const idx = desc.indexOf(marker);
+  if (idx === -1) return null;
+  const raw = desc.slice(idx + marker.length).trim();
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn('Failed to parse file metadata', e);
+    return null;
+  }
+}
+
+async function pollLiveFile(jobId, filePath) {
+  if (!jobId || !filePath) return;
+  const url = `/api/jobs/${encodeURIComponent(jobId)}/files/${encodeURIComponent(filePath)}`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data && data.content !== undefined) {
+      document.getElementById('live-file-content').textContent = data.content || '(empty)';
+      document.getElementById('live-file-meta').textContent = `${filePath} • ${data.size} bytes`;
+    }
+  } catch (err) {
+    console.warn('Live file fetch error', err);
+  }
+}
+
+function showLiveFile(jobId, filePath) {
+  if (state.currentLiveFileJob === jobId && state.currentLiveFilePath === filePath) return;
+  hideLiveFile();
+  state.currentLiveFileJob = jobId;
+  state.currentLiveFilePath = filePath;
+  document.getElementById('live-file-content').textContent = 'Loading…';
+  pollLiveFile(jobId, filePath);
+  state.liveFileTimer = setInterval(() => pollLiveFile(jobId, filePath), 2000);
+}
+
+function hideLiveFile() {
+  if (state.liveFileTimer) clearInterval(state.liveFileTimer);
+  state.liveFileTimer = null;
+  state.currentLiveFileJob = null;
+  state.currentLiveFilePath = null;
+  document.getElementById('live-file-content').textContent = 'No active file';
+  document.getElementById('live-file-meta').textContent = 'No file';
+}
+
 function onValidation(ev) {
   const r = ev.validation_result || {};
   const ok = r.syntax_ok;
+  state.testStatus = ok ? "Validation OK" : "Syntax error";
+  updateSummaryPanel();
   appendLog(`Validation ${ok ? "✓ syntax ok" : "✗ syntax error"}`, ok ? "success" : "warning");
 }
 
@@ -788,7 +903,10 @@ function renderTasks() {
     const row = document.createElement("div");
     row.className = "task-row";
     const checked = info.state === "completed" ? "checked" : "";
-    const title = info.title || tid;
+    const rawTitle = info.title ? String(info.title).trim() : "";
+    const taskTitle = rawTitle || tid;
+    const stepPrefix = info.step_number ? `${info.step_number}. ` : "";
+    const title = stepPrefix + taskTitle;
     const description = info.description ? `\n${info.description}` : "";
     row.innerHTML = `
       <input class="task-checkbox" type="checkbox" disabled ${checked}>
@@ -824,12 +942,13 @@ async function selectJob(jobId) {
   const tasks = await fetch(`/api/jobs/${jobId}/tasks`).then(r => r.json()).catch(() => []);
   state.tasks = {};
   for (const t of tasks) {
-    const rawTitle = t.title || t.task_id;
+    const rawTitle = typeof t.title === "string" && t.title.trim() ? t.title.trim() : t.task_id;
     const title = (rawTitle === t.task_id)
       ? t.task_id.replace(/^[0-9a-f-]{36}:/, "")
       : rawTitle;
     state.tasks[t.task_id] = {
       title: title,
+      step_number: t.step_number || null,
       description: t.description || "",
       agent_type: t.agent_type,
       state: t.state,
@@ -950,29 +1069,85 @@ function appendLog(msg, cls = "debug") {
   el.scrollTop = el.scrollHeight;
 }
 
-function appendChat(speaker, msg, cls = "system") {
-  if (!msg) return;
-  const el = document.getElementById("chat");
-  const div = document.createElement("div");
-  div.className = "chat-msg";
-  const ts = new Date().toTimeString().slice(0,8);
-  div.innerHTML = `<div class="chat-speaker speaker-${cls}">[${ts}] ${speaker}</div><div class="chat-text">${escHtml(String(msg))}</div>`;
-  el.appendChild(div);
-  el.scrollTop = el.scrollHeight;
+function showLoading(show = true) {
+  const loadingEl = document.getElementById("ai-summary-loading");
+  if (loadingEl) {
+    loadingEl.style.display = show ? "block" : "none";
+  }
 }
 
 function formatAgentMsg(out) {
   if (typeof out !== "object" || out === null) return String(out);
-  if (out.summary) {
-    let s = out.summary;
-    if (out.files_produced?.length) s += "\nFiles: " + out.files_produced.slice(0,5).join(", ");
-    return s;
+
+  const payload = { ...out };
+  delete payload.prompt;
+
+  if (payload.tests_passed !== undefined) {
+    return `Tests passed: ${payload.tests_passed}, failed: ${payload.tests_failed || 0}, ready_for_review: ${payload.ready_for_review}`;
   }
-  if (out.tasks_created !== undefined) {
-    const ms = (out.milestones || []).slice(0,5).join(", ");
-    return `Created ${out.tasks_created} tasks. Milestones: ${ms}`;
+  if (payload.approved !== undefined) {
+    return `Approved: ${payload.approved ? "yes" : "no"}, issues_found: ${payload.issues_found || 0}, assessment: ${payload.assessment || ""}`;
   }
-  return JSON.stringify(out).slice(0,200);
+  if (payload.file_path) {
+    return `File: ${payload.file_path}`;
+  }
+  if (Array.isArray(payload.files_created) && payload.files_created.length) {
+    return `Files created: ${payload.files_created.slice(0,5).join(", ")}`;
+  }
+  if (payload.file_count !== undefined) {
+    return `File count: ${payload.file_count}${payload.file_path ? `, file_path: ${payload.file_path}` : ""}`;
+  }
+  if (payload.summary) {
+    let summaryText = payload.summary;
+    if (Array.isArray(payload.files_produced) && payload.files_produced.length) {
+      summaryText += "\nFiles: " + payload.files_produced.slice(0,5).join(", ");
+    }
+    return summaryText;
+  }
+  if (payload.tasks_created !== undefined) {
+    const ms = (payload.milestones || []).slice(0,5).join(", ");
+    return `Created ${payload.tasks_created} tasks. Milestones: ${ms}`;
+  }
+  return JSON.stringify(payload).slice(0,200);
+}
+
+function shortPrompt(prompt) {
+  const lines = String(prompt).split(/\r?\n/).filter(Boolean);
+  return lines.slice(0, 10).join("\n");
+}
+
+function addFileChange(path) {
+  if (!path) return;
+  if (!state.fileChanges.includes(path)) {
+    state.fileChanges.push(path);
+    updateSummaryPanel();
+  }
+}
+
+function updateSummaryPanel() {
+  const meta = document.getElementById('ai-summary-meta');
+  const content = document.getElementById('ai-summary-content');
+  if (meta) {
+    meta.textContent = `Iterations: ${state.iterations} | Tests: ${state.testStatus}`;
+  }
+  if (content) {
+    const fileList = state.fileChanges.length ? state.fileChanges.map(path => `- ${path}`).join("\n") : "No files created or modified yet.";
+    
+    let interactionsText = "";
+    if (state.liveResponse) {
+      const livePrompt = shortPrompt(state.liveResponse.prompt);
+      interactionsText += `\n\n=== Live response from ${state.liveResponse.agent} ===\nPrompt:\n${livePrompt}\n\n${state.liveResponse.response}\n`;
+    }
+    if (state.interactions.length > 0) {
+      interactionsText += "\n\n=== Agent Interactions ===\n";
+      state.interactions.forEach((inter, idx) => {
+        const promptShort = shortPrompt(inter.prompt);
+        interactionsText += `\n--- ${inter.agent} (${idx + 1}) ---\nPrompt:\n${promptShort}\n\nResponse:\n${inter.response}\n`;
+      });
+    }
+    
+    content.textContent = `Files:\n${fileList}\n\nIterations: ${state.iterations}\nTest status: ${state.testStatus}${interactionsText}`;
+  }
 }
 
 function escHtml(s) {
@@ -1055,9 +1230,12 @@ async function startJob() {
   // Reset agent states
   for (const a of ["planner","coder","critic","tester","synthesizer"]) setAgent(a, "idle");
   state.tasks = {};
+  state.fileChanges = [];
+  state.interactions = [];
+  state.iterations = 0;
   renderTasks();
-  document.getElementById("chat").innerHTML = "";
-  appendChat("System", `New job submitted: ${goal}`, "system");
+  updateSummaryPanel();
+  showLoading(true);
   setStatusDot("submitted");
   setFooter("Submitting…", "");
   const res = await fetch("/api/jobs", {
@@ -1088,7 +1266,7 @@ document.getElementById("goal-file-input").addEventListener("change", async (eve
   try {
     const text = await file.text();
     document.getElementById('goal-input').value = text.trim();
-    appendChat('System', `Loaded goal from ${file.name}`, 'system');
+    // Goal loaded from file
   } catch (err) {
     appendLog(`Failed to load goal file: ${err}`, 'error');
   }

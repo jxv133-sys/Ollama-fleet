@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pydantic import ValidationError
 
+from ollama_fleet.agents import coder as coder_module
 from ollama_fleet.agents.schemas import (
     AgentOutput,
     AgentType,
@@ -31,10 +32,8 @@ _PROMPT_TEMPLATES: dict[AgentType, str] = {
         "\nTask list item: task_id, step_number, title, description, agent_type, dependencies, priority."
     ),
     AgentType.CODER: (
-        "You are a coding agent. Generate file changes based on the task and existing context. "
-        "Output valid JSON only."
-        "\n\nRequired keys: file_modifications, summary, confidence_score."
-        "\nfile_modifications items: file_path, operation, content."
+        "You are a coding agent. Generate the complete contents of a single file. "
+        "Return only raw source code. Do not output JSON, markdown, code fences, or explanation."
     ),
     AgentType.CRITIC: (
         "You are a critic agent. Review the code and report any issues. Output valid JSON only."
@@ -82,9 +81,15 @@ class AgentPromptBuilder:
         if context:
             prompt_parts.append(f"\n\nCONTEXT:\n{context}")
 
-        prompt_parts.append(
-            "\n\nImportant: return parsable JSON only. Do not include markdown, explanation, or code fences."
-        )
+        if agent_type == AgentType.CODER:
+            prompt_parts.append(
+                "\n\nImportant: return only raw source code for the requested file. "
+                "Do not include markdown, explanation, code fences, or JSON."
+            )
+        else:
+            prompt_parts.append(
+                "\n\nImportant: return parsable JSON only. Do not include markdown, explanation, or code fences."
+            )
         return "".join(prompt_parts)
 
 
@@ -112,6 +117,10 @@ class AgentPipeline:
 
     def parse_agent_output(self, agent_type: AgentType, output_text: str) -> AgentOutput:
         """Validate model response against the expected agent schema."""
+        if agent_type == AgentType.CODER:
+            content = coder_module.normalize_coder_response(output_text)
+            return CoderOutput.model_validate({"content": content})
+
         schema_cls = _SCHEMA_BY_AGENT[agent_type]
         try:
             return schema_cls.model_validate_json(output_text)

@@ -68,8 +68,8 @@ async def main() -> int:
     task = {"task_id": "test-planner-1", "goal": "Connectivity test", "description": "Return a valid minimal planner JSON response."}
     try:
         print("Running AgentExecutor.execute for Planner (may take longer)...")
-        out = await executor.execute(task, AgentType.PLANNER, extra_context={})
-        print("Planner output type:", type(out), "\nSummary (repr):", repr(getattr(out, 'architecture_notes', '') or str(out)[:200]))
+        out, prompt = await executor.execute(task, AgentType.PLANNER, extra_context={})
+        print("Planner output type:", type(out), "\nPrompt (truncated):", repr(prompt[:200]))
     except Exception as e:
         print("AgentExecutor failed:", e)
         return 6

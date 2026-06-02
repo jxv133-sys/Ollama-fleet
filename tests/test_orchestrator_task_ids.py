@@ -61,3 +61,35 @@ def test_create_tasks_from_planner_drops_unknown_dependencies() -> None:
     assert tasks[0]["task_id"] == "job-123:task_002"
     assert tasks[0]["dependencies"] == []
     assert tasks[0]["state"] == "pending"
+
+
+def test_create_tasks_from_planner_renames_duplicate_task_ids() -> None:
+    planner_output = PlannerOutput(
+        tasks=[
+            PlannerTask(
+                task_id="task_001",
+                title="Build",
+                description="Build the thing",
+                agent_type="coder",
+                dependencies=[],
+                priority=5,
+            ),
+            PlannerTask(
+                task_id="task_001",
+                title="Build duplicate",
+                description="Build another thing",
+                agent_type="coder",
+                dependencies=["task_001"],
+                priority=5,
+            ),
+        ],
+        milestones=[],
+        architecture_notes="",
+    )
+
+    tasks = Orchestrator._create_tasks_from_planner(planner_output, "job-123")
+
+    assert tasks[0]["task_id"] == "job-123:task_001"
+    assert tasks[1]["task_id"] == "job-123:task_001_2"
+    assert tasks[1]["dependencies"] == ["job-123:task_001"]
+    assert tasks[1]["state"] == "blocked"

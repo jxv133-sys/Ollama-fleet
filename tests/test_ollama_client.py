@@ -326,6 +326,28 @@ async def test_generate_raises_connection_error_on_connect_timeout():
             await client.generate("llama3", "prompt", timeout=30.0)
 
 
+@pytest.mark.asyncio
+async def test_generate_raises_connection_error_on_protocol_error():
+    """httpx.ProtocolError is mapped to OllamaConnectionError."""
+
+    @asynccontextmanager
+    async def _failing_client():
+        mock = MagicMock()
+
+        @asynccontextmanager
+        async def _stream(*args, **kwargs):
+            raise httpx.ProtocolError("Protocol broken")
+            yield
+
+        mock.stream = _stream
+        yield mock
+
+    with patch("ollama_fleet.ollama.client.httpx.AsyncClient", _failing_client):
+        client = OllamaClient()
+        with pytest.raises(OllamaConnectionError):
+            await client.generate("llama3", "prompt", timeout=30.0)
+
+
 # ---------------------------------------------------------------------------
 # Timeout error mapping
 # ---------------------------------------------------------------------------
@@ -442,4 +464,6 @@ async def test_generate_posts_to_correct_endpoint():
     assert captured["json"]["model"] == "mymodel"
     assert captured["json"]["prompt"] == "my prompt"
     assert captured["json"]["format"] == "json"
-    assert captured["timeout"] == 60.0
+    assert isinstance(captured["timeout"], httpx.Timeout)
+    assert captured["timeout"].read == 60.0
+    assert captured["timeout"].connect == 10.0

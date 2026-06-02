@@ -152,12 +152,10 @@ class FleetTkApp(tk.Tk):
         self._orchestrator = None
         self._job_running = False
         
-        # Auto-start if goal provided via CLI and demo mode
-        if self.goal != "Demo GUI" or self.use_demo:
-            self.after(100, self._on_start)
+        self.file_changes: list[str] = []
+        self.iteration_count = 0
+        self.tests_status = "pending"
 
-    def _build_model_selection_section(self, parent: ttk.Frame) -> None:
-        """Build per-agent model selection controls."""
         models_frame = ttk.Frame(parent)
         models_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 4))
         models_frame.grid_columnconfigure(1, weight=1)
@@ -203,21 +201,36 @@ class FleetTkApp(tk.Tk):
             self.model_menus[key] = menu
 
     def _build_ai_chat_section(self, parent: ttk.Frame) -> None:
-        """Build the AI conversation display section."""
-        ttk.Label(parent, text="AI Chat", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+        """Build the AI summary display section (chat removed)."""
+        ttk.Label(parent, text="AI Status", font=("TkDefaultFont", 11, "bold")).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
 
         self.job_id_var = tk.StringVar(value="–")
         self.job_state_var = tk.StringVar(value="idle")
         self.job_goal_var = tk.StringVar(value="–")
 
+        self.ai_summary_var = tk.StringVar(value="Files: none | Iterations: 0 | Tests: pending")
+        ttk.Label(parent, textvariable=self.ai_summary_var, font=("TkDefaultFont", 9, "italic")).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 2))
+
+        # Container frame for layering loading indicator and summary
+        container = ttk.Frame(parent)
+        container.grid(row=2, column=0, sticky="nsew", padx=4, pady=2)
+
+        # Loading indicator frame
+        self.loading_frame = ttk.Frame(container)
+        self.loading_frame.place(x=0, y=0, relwidth=1, relheight=1)
+        self.loading_label = ttk.Label(self.loading_frame, text="⏳ Waiting on agent response...", font=("TkDefaultFont", 9, "italic"), foreground="gray")
+        self.loading_label.pack(fill=tk.BOTH, expand=True)
+        self.loading_visible = False
+
+        # Summary text area
         self.ai_chat = scrolledtext.ScrolledText(
-            parent,
+            container,
             height=8,
             font=("TkDefaultFont", 9),
             wrap=tk.WORD,
             state=tk.DISABLED,
         )
-        self.ai_chat.grid(row=1, column=0, sticky="nsew", padx=4, pady=2)
+        self.ai_chat.place(x=0, y=0, relwidth=1, relheight=1)
         self.ai_chat.tag_config("planner", foreground="#0066CC")
         self.ai_chat.tag_config("coder", foreground="#00AA00")
         self.ai_chat.tag_config("critic", foreground="#CC6600")
@@ -765,36 +778,35 @@ class FleetTkApp(tk.Tk):
 
         # Log the state change
         self._append_output(f"Job {new_state.upper()}", "info")
-        self._append_chat("System", f"Job {new_state}", "system" if new_state != "failed" else "error")
+        if new_state in ("completed", "failed"):
+            self._show_loading(False)
 
     def _handle_agent_log(self, event: dict[str, Any]) -> None:
         """Handle agent log message."""
         msg = event.get("message", "")
         level = event.get("level", "debug")
         self._append_output(msg, level)
-        
-        # Parse agent logs to update agent status
-        msg_lower = msg.lower()
-        if "planner" in msg_lower and "created" in msg_lower:
-            # Planner completed: "[PLANNER] Created X tasks ready for execution"
-            self.agents_vars["planner"].set("✓ Completed")
-            self.agents_labels["planner"].config(foreground="green")
-            self._append_output("Planner agent completed", "info")
-            self._append_chat("Planner", msg, "planner")
 
     def _handle_agent_output(self, event: dict[str, Any]) -> None:
         """Handle agent output."""
+        self._show_loading(False)
         agent_type = event.get("agent_type", "?").lower()
         output = event.get("output", "")
+        prompt = event.get("prompt") or (output.get("prompt") if isinstance(output, dict) else None)
         
-        # Format: [AGENT] output with agent-specific color
-        msg = f"[{agent_type.upper()}] {output}"
-        self._append_output(msg, agent_type)
-        self._append_chat(agent_type.title(), self._format_agent_message(output), agent_type)
-        
+        # Show prompt and response in the summary panel.
+        if prompt:
+            short_prompt = self._shorten_text(str(prompt), max_lines=8)
+            self._append_chat(f"{agent_type.title()} Prompt", short_prompt, agent_type)
+        self._append_chat(f"{agent_type.title()} Response", self._format_agent_message(output), agent_type)
+        self._append_output(f"[{agent_type.upper()}] {output}", agent_type)
+
+        if agent_type == "coder":
+            self.iteration_count += 1
+            self._update_summary_label()
+
         # Update agent status for agents with output
         if agent_type in self.agents_labels:
-            # Agent is running/producing output
             if "error" not in str(output).lower():
                 self.agents_vars[agent_type].set(f"✓ Completed")
                 self.agents_labels[agent_type].config(foreground="green")
@@ -804,6 +816,12 @@ class FleetTkApp(tk.Tk):
         task_id = event.get("task_id", "?")
         new_state = event.get("new_state", "–")
         agent_type = event.get("agent_type", "?").lower()
+        
+        # Show loading when tasks are running, hide when complete or failed
+        if new_state == "running":
+            self._show_loading(True)
+        elif new_state in ("completed", "failed"):
+            self._show_loading(False)
         
         # Update agent status based on task state
         if agent_type in self.agents_labels:
@@ -837,12 +855,17 @@ class FleetTkApp(tk.Tk):
     def _handle_file_written(self, event: dict[str, Any]) -> None:
         """Handle file written event."""
         path = event.get("path", "?")
+        if path not in self.file_changes:
+            self.file_changes.append(path)
+        self._update_summary_label()
         self._append_output(f"File created: {path}", "success")
 
     def _handle_validation_result(self, event: dict[str, Any]) -> None:
         """Handle validation result."""
         result = event.get("validation_result", {})
         status = result.get("status", "unknown")
+        self.tests_status = "OK" if status == "valid" else "Failed"
+        self._update_summary_label()
         msg = f"Validation {status}: {result.get('message', '')}"
         level = "success" if status == "valid" else "warning"
         self._append_output(msg, level)
@@ -854,20 +877,37 @@ class FleetTkApp(tk.Tk):
         self._append_output(f"⚠ ESCALATION: {reason}", "warning")
 
     def _append_chat(self, speaker: str, msg: str, tag: str = "system") -> None:
-        """Append one message to the AI chat panel."""
+        """Append one message to the AI summary panel."""
         if not msg:
             return
-        timestamp = datetime.now().strftime("%H:%M:%S")
         self.ai_chat.configure(state=tk.NORMAL)
-        self.ai_chat.insert(tk.END, f"[{timestamp}] {speaker}: ", tag)
-        self.ai_chat.insert(tk.END, f"{msg}\n\n", tag)
+        self.ai_chat.insert(tk.END, f"{speaker}: {msg}\n\n", tag)
         self.ai_chat.configure(state=tk.DISABLED)
         self.ai_chat.see(tk.END)
+
+    def _show_loading(self, visible: bool = True) -> None:
+        """Show or hide the loading indicator."""
+        if visible and not self.loading_visible:
+            self.loading_frame.lift()
+            self.loading_visible = True
+        elif not visible and self.loading_visible:
+            self.ai_chat.lift()
+            self.loading_visible = False
+
+    @staticmethod
+    def _shorten_text(text: str, max_lines: int = 5) -> str:
+        """Truncate text to max_lines for display in summary."""
+        lines = str(text).split('\n')
+        if len(lines) > max_lines:
+            return '\n'.join(lines[:max_lines]) + f'\n... ({len(lines) - max_lines} more lines)'
+        return text
 
     @staticmethod
     def _format_agent_message(output: Any) -> str:
         """Convert agent output dictionaries into compact chat text."""
         if isinstance(output, dict):
+            if "content" in output:
+                return str(output["content"])
             if "summary" in output:
                 pieces = [str(output["summary"])]
                 files = output.get("files_produced")
@@ -877,8 +917,7 @@ class FleetTkApp(tk.Tk):
             if "tasks_created" in output:
                 milestones = output.get("milestones") or []
                 return f"Created {output['tasks_created']} tasks. Milestones: {', '.join(map(str, milestones[:5]))}"
-            if "summary" in output:
-                return str(output["summary"])
+            return str(output)
         return str(output)
 
     def _append_output(self, msg: str, tag: str = "debug") -> None:
@@ -889,6 +928,10 @@ class FleetTkApp(tk.Tk):
         self.raw_output.insert(tk.END, log_line, tag)
         self.raw_output.see(tk.END)
         self.raw_output.update_idletasks()
+
+    def _update_summary_label(self) -> None:
+        files_label = ", ".join(self.file_changes) if self.file_changes else "none"
+        self.ai_summary_var.set(f"Files: {files_label} | Iterations: {self.iteration_count} | Tests: {self.tests_status}")
 
 
 def main() -> int:

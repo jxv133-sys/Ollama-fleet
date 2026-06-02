@@ -43,7 +43,11 @@ class Orchestrator:
         self.settings = settings
         self.job_manager = JobManager(db)
         self.scheduler = TaskScheduler(db)
-        self.executor = AgentExecutor(OllamaClient(settings.ollama.base_url), settings)
+        self.executor = AgentExecutor(
+            OllamaClient(settings.ollama.base_url),
+            settings,
+            ui_bus=ui_bus,
+        )
         self.validation = ValidationLayer()
         self.memory_system = MemorySystem(db, settings, self.executor.client)
         self.revision_counts: dict[str, int] = {}
@@ -92,7 +96,7 @@ class Orchestrator:
         escalation_manager = EscalationManager(self.db, workspace_manager)
 
         try:
-            planner_output = await self._run_planner(goal)
+            planner_output, planner_prompt = await self._run_planner(goal)
         except Exception as exc:
             logger.exception("Planner failed for job %s", job_id)
             await self.job_manager.update_job_state(job_id, "failed")
@@ -130,6 +134,7 @@ class Orchestrator:
                 "tasks_created": len(tasks),
                 "milestones": planner_output.milestones,
                 "architecture": planner_output.architecture_notes[:100] if planner_output.architecture_notes else "",
+                "prompt": planner_prompt,
             }
         })
         
@@ -142,6 +147,7 @@ class Orchestrator:
         planner_output_data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_type": AgentType.PLANNER.value,
+            "prompt": planner_prompt,
             "tasks_created": len(tasks),
             "milestones": planner_output.milestones,
             "architecture_notes": planner_output.architecture_notes,
@@ -334,47 +340,95 @@ class Orchestrator:
             # UI bus failures are non-fatal but logged for debugging
             logger.debug("Failed to publish event: %s", exc)
 
-    async def _run_planner(self, goal: str) -> PlannerOutput:
-        output = await self.executor.execute(
-            {
-                "task_id": "planner",
-                "goal": goal,
-                "description": "",
-            },
-            AgentType.PLANNER,
-            extra_context={"architecture_notes": ""},
-        )
-        if not isinstance(output, PlannerOutput):
+    async def _run_planner(self, goal: str) -> tuple[PlannerOutput, str]:
+        try:
+            parsed, prompt = await self.executor.execute(
+                {
+                    "task_id": "planner",
+                    "goal": goal,
+                    "description": "",
+                },
+                AgentType.PLANNER,
+                extra_context={"architecture_notes": ""},
+            )
+        except Exception as exc:
+            logger.error("Planner request failed: %s", exc, exc_info=True)
+            raise
+        if not isinstance(parsed, PlannerOutput):
             raise RuntimeError("Planner did not return a PlannerOutput")
-        return output
+        return parsed, prompt
 
     @staticmethod
     def _create_tasks_from_planner(planner_output: PlannerOutput, job_id: str) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc).isoformat()
-        task_id_map = {
-            task.task_id: f"{job_id}:{task.task_id}"
-            for task in planner_output.tasks
-        }
-        known_task_ids = set(task_id_map.values())
-        tasks = []
-        for task in planner_output.tasks:
+        task_id_counter: dict[str, int] = {}
+        canonical_task_id: dict[str, str] = {}
+        resolved_task_ids: list[str] = []
+
+        for i, task in enumerate(planner_output.tasks):
+            original_task_id = task.task_id or f"task_{i + 1:03d}"
+            count = task_id_counter.get(original_task_id, 0) + 1
+            task_id_counter[original_task_id] = count
+
+            if count == 1:
+                resolved_task_id = original_task_id
+                canonical_task_id.setdefault(original_task_id, resolved_task_id)
+            else:
+                resolved_task_id = f"{original_task_id}_{count}"
+                logger.warning(
+                    "Duplicate planner task_id detected: %s. Renaming duplicate to %s",
+                    original_task_id,
+                    resolved_task_id,
+                )
+
+            resolved_task_ids.append(resolved_task_id)
+
+        known_task_ids = {f"{job_id}:{task_id}" for task_id in resolved_task_ids}
+        tasks: list[dict[str, Any]] = []
+
+        for task, resolved_task_id in zip(planner_output.tasks, resolved_task_ids):
             dependencies = [
                 mapped_dependency
                 for dependency in task.dependencies
-                if (mapped_dependency := task_id_map.get(dependency, dependency)) in known_task_ids
+                if (mapped_dependency := canonical_task_id.get(dependency, dependency)) in resolved_task_ids
             ]
             state = "pending" if not dependencies else "blocked"
+            # If planner provided a specific file_path for this task, embed
+            # that metadata into the description so the scheduler and
+            # executor can keep a single-task-per-file workflow.
+            description = task.description or ""
+            # Prefer structured file_spec when provided by the Planner. Fall
+            # back to the legacy file_path/required_contents/estimated_size
+            # shape for backwards compatibility.
+            if getattr(task, "file_spec", None):
+                metadata = task.file_spec
+                # Ensure file_path is present in metadata for downstream consumers
+                if getattr(task, "file_path", None) and not metadata.get("file_path"):
+                    metadata["file_path"] = task.file_path
+            elif getattr(task, "file_path", None):
+                metadata = {
+                    "file_path": task.file_path,
+                    "required_contents": getattr(task, "required_contents", []),
+                    "estimated_size": getattr(task, "estimated_size", None),
+                }
+            else:
+                metadata = None
+
+            if metadata:
+                # Append a machine-safe metadata marker to the description
+                description = f"{description}\n\n__FILE_METADATA__:{json.dumps(metadata)}"
+
             tasks.append(
                 {
-                    "task_id": task_id_map[task.task_id],
+                    "task_id": f"{job_id}:{resolved_task_id}",
                     "job_id": job_id,
                     "title": task.title,
-                    "description": task.description,
+                    "description": description,
                     "agent_type": task.agent_type,
                     "state": state,
                     "priority": task.priority,
                     "retry_count": 0,
-                    "dependencies": dependencies,
+                    "dependencies": [f"{job_id}:{dependency}" for dependency in dependencies],
                     "created_at": now,
                     "updated_at": now,
                     "version": 0,
@@ -403,6 +457,37 @@ class Orchestrator:
             "active_files": active_files,
             "episodic_summaries": [],
         }
+        # If the planner embedded file-level metadata in the task description,
+        # extract it here and forward to the coder so it knows the exact file
+        # to produce and what symbols must appear.
+        file_metadata = None
+        try:
+            if task.description and "__FILE_METADATA__:" in task.description:
+                marker = "__FILE_METADATA__:"
+                idx = task.description.index(marker)
+                raw = task.description[idx + len(marker):].strip()
+                file_metadata = json.loads(raw)
+                if file_metadata.get("file_path"):
+                    extra_context["file_path"] = file_metadata.get("file_path")
+                if file_metadata.get("required_contents"):
+                    extra_context["required_contents"] = file_metadata.get("required_contents")
+                if file_metadata.get("estimated_size"):
+                    extra_context["estimated_size"] = file_metadata.get("estimated_size")
+                # New structured file_spec fields
+                if file_metadata.get("imports"):
+                    extra_context["imports"] = file_metadata.get("imports")
+                if file_metadata.get("required_functions"):
+                    extra_context["required_functions"] = file_metadata.get("required_functions")
+                if file_metadata.get("required_behavior"):
+                    extra_context["required_behavior"] = file_metadata.get("required_behavior")
+                if file_metadata.get("forbidden_behavior"):
+                    extra_context["forbidden_behavior"] = file_metadata.get("forbidden_behavior")
+                if file_metadata.get("purpose"):
+                    extra_context["purpose"] = file_metadata.get("purpose")
+        except Exception:
+            # Non-fatal: if parsing fails, ignore metadata and proceed with
+            # a general coder task.
+            file_metadata = None
         if task.task_id in self.revision_issues:
             extra_context["critic_issues"] = self.revision_issues[task.task_id]
 
@@ -415,7 +500,7 @@ class Orchestrator:
         extra_context["active_files"] = memory_context.active_files
         extra_context["episodic_summaries"] = memory_context.episodic_summaries
 
-        coder_output = await self.executor.execute(
+        coder_output, coder_prompt = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -430,10 +515,10 @@ class Orchestrator:
             "type": "agent_output",
             "agent_type": AgentType.CODER.value,
             "output": {
-                "file_count": len(coder_output.file_modifications) if isinstance(coder_output, CoderOutput) else 0,
-                "confidence": coder_output.confidence_score if isinstance(coder_output, CoderOutput) else 0,
-                "summary": coder_output.summary if isinstance(coder_output, CoderOutput) else "",
-            }
+                "file_count": 1 if isinstance(coder_output, CoderOutput) else 0,
+                "file_path": file_metadata.get("file_path") if file_metadata else "",
+                "prompt": coder_prompt,
+            },
         })
 
         if not isinstance(coder_output, CoderOutput):
@@ -448,12 +533,27 @@ class Orchestrator:
             )
             return
 
-        current_modifications = [
-            (change.file_path, change.content) for change in coder_output.file_modifications
-        ]
+        file_path = None
+        if file_metadata and isinstance(file_metadata, dict):
+            file_path = file_metadata.get("file_path")
+        if not file_path:
+            await self.scheduler.transition(task.task_id, "failed", reason="Missing file_path metadata for coder task")
+            self._publish_event(
+                {
+                    "type": "task_state_changed",
+                    "task_id": task.task_id,
+                    "agent_type": task.agent_type,
+                    "new_state": "failed",
+                    "reason": "Missing file_path metadata for coder task",
+                }
+            )
+            return
+
+        if isinstance(file_path, str) and file_path.startswith("/"):
+            file_path = str(Path(file_path).relative_to(Path(file_path).anchor))
+
+        current_modifications = [(file_path, coder_output.content)]
         if self.previous_coder_outputs.get(task.task_id) == current_modifications:
-            # Coder produced identical output twice — escalate but requeue rather
-            # than hard-failing, so the task gets one more attempt with a fresh prompt.
             await escalation_manager.write_escalation(
                 task_id=task.task_id,
                 job_id=task.job_id,
@@ -465,7 +565,6 @@ class Orchestrator:
                 "message": f"Task {task.task_id}: identical output detected, requeuing.",
                 "level": "warning",
             })
-            # Clear cache so the next attempt isn't immediately rejected again
             self.previous_coder_outputs.pop(task.task_id, None)
             await self.scheduler.transition(task.task_id, "pending")
             self._publish_event({
@@ -478,60 +577,34 @@ class Orchestrator:
 
         self.previous_coder_outputs[task.task_id] = current_modifications
 
-        if not coder_output.file_modifications:
-            await self.scheduler.transition(task.task_id, "failed", reason="Coder produced no file modifications")
-            self._publish_event(
-                {
-                    "type": "task_state_changed",
-                    "task_id": task.task_id,
-                    "agent_type": task.agent_type,
-                    "new_state": "failed",
-                    "reason": "Coder produced no file modifications",
-                }
-            )
-            return
-
         modified_files: list[str] = []
-        for change in coder_output.file_modifications:
-            workspace_manager.write_file(change.file_path, change.content)
-            # Normalize to a workspace-relative path so downstream consumers
-            # (validator, critic, episodic memory) can safely join it with
-            # workspace_manager.root. The model may return absolute paths like
-            # "/path/to/file.py" or placeholders; write_file already strips the
-            # leading anchor, so we derive the canonical relative path from the
-            # resolved absolute path that was actually written.
-            raw = Path(change.file_path)
-            if raw.is_absolute():
-                raw = raw.relative_to(raw.anchor)
-            rel_path = str(raw)
-            modified_files.append(rel_path)
-            # Publish file written event
-            self._publish_event({
-                "type": "file_written",
-                "path": rel_path,
-                "job_id": task.job_id,
-            })
+        rel_path = file_path
+        workspace_manager.write_file(rel_path, coder_output.content)
+        raw = Path(rel_path)
+        if raw.is_absolute():
+            raw = raw.relative_to(raw.anchor)
+        rel_path = str(raw)
+        modified_files.append(rel_path)
+        self._publish_event({
+            "type": "file_written",
+            "path": rel_path,
+            "job_id": task.job_id,
+        })
 
         validation_result = self.validation.validate(modified_files, workspace_manager)
         self._publish_event(
             {"type": "validation_result", "validation_result": vars(validation_result)}
         )
-        
+
         # Save coder output to workspace
         coder_output_data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_type": AgentType.CODER.value,
+            "prompt": coder_prompt,
             "task_id": task.task_id,
-            "summary": coder_output.summary,
-            "confidence_score": coder_output.confidence_score,
-            "file_modifications": [
-                {
-                    "file_path": mod.file_path,
-                    "content_preview": mod.content[:200] if len(mod.content) > 200 else mod.content,
-                    "content_length": len(mod.content),
-                }
-                for mod in coder_output.file_modifications
-            ],
+            "file_path": rel_path,
+            "content_preview": coder_output.content[:200] if len(coder_output.content) > 200 else coder_output.content,
+            "content_length": len(coder_output.content),
             "files_created": modified_files,
             "validation": {
                 "syntax_ok": validation_result.syntax_ok,
@@ -544,7 +617,7 @@ class Orchestrator:
             f"agent_outputs/coder_{coder_count}.json",
             json.dumps(coder_output_data, indent=2),
         )
-        
+
         if not validation_result.syntax_ok:
             await self.scheduler.transition(task.task_id, "pending")
             self._publish_event(
@@ -557,7 +630,7 @@ class Orchestrator:
             )
             return
 
-        critic_output = await self.executor.execute(
+        critic_output, critic_prompt = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -583,6 +656,7 @@ class Orchestrator:
                 "approved": critic_output.approved if isinstance(critic_output, CriticOutput) else False,
                 "issues_found": len(critic_output.issues) if isinstance(critic_output, CriticOutput) else 0,
                 "assessment": critic_output.overall_assessment if isinstance(critic_output, CriticOutput) else "",
+                "prompt": critic_prompt,
             }
         })
         
@@ -591,6 +665,7 @@ class Orchestrator:
             critic_output_data = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "agent_type": AgentType.CRITIC.value,
+                "prompt": critic_prompt,
                 "task_id": task.task_id,
                 "approved": critic_output.approved,
                 "overall_assessment": critic_output.overall_assessment,
@@ -615,14 +690,6 @@ class Orchestrator:
             await self._handle_critic_output(task, critic_output, escalation_manager)
             return
 
-        if coder_output.confidence_score < 0.4:
-            self._publish_event(
-                {
-                    "type": "agent_log",
-                    "message": f"Low confidence detected for {task.task_id}: {coder_output.confidence_score:.2f}",
-                }
-            )
-
         await self.memory_system.save_episodic(
             EpisodicEntry(
                 job_id=task.job_id,
@@ -630,7 +697,11 @@ class Orchestrator:
                 agent_type=task.agent_type,
                 outcome="completed",
                 files_modified=modified_files,
-                summary_text=coder_output.summary,
+                summary_text=(
+                    f"Generated file {modified_files[0]}"
+                    if modified_files
+                    else "Generated code file"
+                ),
                 timestamp=datetime.now(timezone.utc).isoformat(),
             )
         )
@@ -727,7 +798,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("Failed to run tests for workspace: %s", exc)
 
-        tester_output = await self.executor.execute(
+        tester_output, tester_prompt = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -745,6 +816,7 @@ class Orchestrator:
                         "tests_passed": tester_output.tests_passed,
                         "tests_failed": tester_output.tests_failed,
                         "ready_for_review": tester_output.ready_for_review,
+                        "prompt": tester_prompt,
                     },
                 }
             )
@@ -782,7 +854,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("Failed to assemble episodic memory for synthesizer: %s", exc)
 
-        synthesizer_output = await self.executor.execute(
+        synthesizer_output, synthesizer_prompt = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": goal,
@@ -803,29 +875,10 @@ class Orchestrator:
                     "output": {
                         "summary": synthesizer_output.summary,
                         "files_produced": synthesizer_output.files_produced,
+                        "prompt": synthesizer_prompt,
                     },
                 }
             )
-            # ----------------------------------------------------------------
-            # Agent collaboration: if the synthesizer identified next_steps,
-            # run a refiner pass where those suggestions are fed back to the
-            # coder for a final improvement round.
-            # ----------------------------------------------------------------
-            if synthesizer_output.next_steps and job is not None:
-                try:
-                    await self._run_refiner_pass(
-                        job_id=task.job_id,
-                        goal=goal,
-                        next_steps=synthesizer_output.next_steps,
-                        workspace_manager=WorkspaceManager(job.workspace_path),
-                    )
-                except Exception as exc:
-                    logger.warning("Refiner pass failed (non-fatal): %s", exc)
-                    self._publish_event({
-                        "type": "agent_log",
-                        "message": f"Refiner pass skipped: {exc}",
-                        "level": "warning",
-                    })
 
         await self.scheduler.transition(task.task_id, "completed")
         self._publish_event(
@@ -836,142 +889,6 @@ class Orchestrator:
                 "new_state": "completed",
             }
         )
-
-    async def _run_refiner_pass(
-        self,
-        job_id: str,
-        goal: str,
-        next_steps: list[str],
-        workspace_manager: WorkspaceManager,
-    ) -> None:
-        """Agent collaboration: synthesizer → coder improvement loop.
-
-        The synthesizer's next_steps are fed back to the coder as a targeted
-        refinement prompt. The coder produces improvements, the critic reviews
-        them, and the results are written back to the workspace. This is a
-        single best-effort pass — failures are logged but never propagate.
-        """
-        self._publish_event({
-            "type": "agent_log",
-            "message": f"[REFINER] Starting agent collaboration pass with {len(next_steps)} improvement suggestions.",
-            "level": "info",
-        })
-
-        # Collect all current source files for context
-        src_files = [
-            str(p.relative_to(workspace_manager.root))
-            for p in workspace_manager.root.rglob("*.py")
-            if p.is_file() and "agent_outputs" not in str(p)
-        ]
-        file_contents = {
-            path: (workspace_manager.root / path).read_text(encoding="utf-8")
-            for path in src_files
-            if (workspace_manager.root / path).exists()
-        }
-
-        improvement_description = (
-            f"Improve the existing codebase for goal: {goal}\n\n"
-            "The synthesizer agent reviewed the completed code and identified these improvements:\n"
-            + "\n".join(f"- {step}" for step in next_steps[:5])
-            + "\n\nApply these improvements to the existing files. "
-            "Only modify files that need changes. Keep working code intact."
-        )
-
-        self._publish_event({
-            "type": "agent_log",
-            "message": "[REFINER] Coder agent applying synthesizer suggestions…",
-            "level": "info",
-        })
-
-        refiner_output = await self.executor.execute(
-            {
-                "task_id": f"{job_id}:refiner",
-                "goal": goal,
-                "description": improvement_description,
-            },
-            AgentType.CODER,
-            extra_context={
-                "active_files": src_files,
-                "episodic_summaries": [f"Improvement suggestions: {'; '.join(next_steps[:3])}"],
-                "critic_issues": [],
-            },
-        )
-
-        if not isinstance(refiner_output, CoderOutput) or not refiner_output.file_modifications:
-            self._publish_event({
-                "type": "agent_log",
-                "message": "[REFINER] No modifications produced — skipping.",
-                "level": "info",
-            })
-            return
-
-        # Write refined files
-        modified_files: list[str] = []
-        for change in refiner_output.file_modifications:
-            raw = Path(change.file_path)
-            if raw.is_absolute():
-                raw = raw.relative_to(raw.anchor)
-            rel_path = str(raw)
-            workspace_manager.write_file(change.file_path, change.content)
-            modified_files.append(rel_path)
-            self._publish_event({
-                "type": "file_written",
-                "path": rel_path,
-                "job_id": job_id,
-            })
-
-        self._publish_event({
-            "type": "agent_log",
-            "message": f"[REFINER] Coder updated {len(modified_files)} file(s): {', '.join(modified_files)}",
-            "level": "info",
-        })
-
-        # Quick critic review of the refined output
-        validation_result = self.validation.validate(modified_files, workspace_manager)
-        if not validation_result.syntax_ok:
-            self._publish_event({
-                "type": "agent_log",
-                "message": "[REFINER] Refined output has syntax errors — reverting is not automatic, check workspace.",
-                "level": "warning",
-            })
-            return
-
-        critic_output = await self.executor.execute(
-            {
-                "task_id": f"{job_id}:refiner_critic",
-                "goal": goal,
-                "description": improvement_description,
-            },
-            AgentType.CRITIC,
-            extra_context={
-                "modified_files": modified_files,
-                "file_contents": {
-                    path: (workspace_manager.root / path).read_text(encoding="utf-8")
-                    for path in modified_files
-                },
-                "lint_results": [vars(i) for i in validation_result.lint_results],
-                "critic_issues": [],
-            },
-        )
-
-        approved = isinstance(critic_output, CriticOutput) and critic_output.approved
-        self._publish_event({
-            "type": "agent_output",
-            "agent_type": "refiner",
-            "output": {
-                "files_improved": modified_files,
-                "critic_approved": approved,
-                "summary": refiner_output.summary,
-            },
-        })
-        self._publish_event({
-            "type": "agent_log",
-            "message": (
-                f"[REFINER] Complete — critic {'approved' if approved else 'flagged'} refined output. "
-                f"Files: {', '.join(modified_files)}"
-            ),
-            "level": "info" if approved else "warning",
-        })
 
     async def _check_stall(self) -> None:
         """Background coroutine: detect stalled jobs and escalate them.

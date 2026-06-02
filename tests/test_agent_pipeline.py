@@ -26,6 +26,17 @@ def test_build_prompt_contains_json_instructions() -> None:
     assert "technical_requirements" in prompt
 
 
+def test_build_coder_prompt_requests_raw_source_content() -> None:
+    prompt = AgentPromptBuilder.build_prompt(
+        AgentType.CODER,
+        task_description="Generate src/app.py",
+        context="Existing repo contains app.py",
+    )
+
+    assert "raw source code" in prompt
+    assert "parsable JSON only" not in prompt
+
+
 def test_select_model_falls_back_to_coder_model() -> None:
     settings = FleetSettings(
         ollama={
@@ -91,8 +102,8 @@ async def test_run_coder_sequence_runs_only_coder_tasks_in_order() -> None:
     client = OllamaClient()
     pipeline = AgentPipeline(client=client, settings=settings)
 
-    output_a = CoderOutput(file_modifications=[], summary="A", confidence_score=0.9)
-    output_b = CoderOutput(file_modifications=[], summary="B", confidence_score=0.8)
+    output_a = CoderOutput(content="# first file\nprint(\"A\")\n")
+    output_b = CoderOutput(content="# second file\nprint(\"B\")\n")
 
     async def fake_run_agent(agent_type, task_description, context="", timeout=None):
         return output_a if "first" in task_description else output_b

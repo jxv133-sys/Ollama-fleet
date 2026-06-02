@@ -8,7 +8,6 @@ from ollama_fleet.agents.schemas import (
     PlannerOutput,
     PlannerTask,
     CoderOutput,
-    FileModification,
     CriticOutput,
     TesterOutput,
 )
@@ -78,17 +77,7 @@ def main():
 if __name__ == '__main__':
     main()
 '''
-            return CoderOutput(
-                file_modifications=[
-                    FileModification(
-                        file_path='calculator.py',
-                        operation='create',
-                        content=code,
-                    )
-                ],
-                summary='Created calculator.py',
-                confidence_score=0.95,
-            )
+            return CoderOutput(content=code)
 
         if agent_type == AgentType.CRITIC:
             return CriticOutput(approved=True, issues=[], overall_assessment='Approved')

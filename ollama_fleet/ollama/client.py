@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -55,7 +55,13 @@ class OllamaClient:
     def __init__(self, base_url: str = "http://192.168.50.142:7869") -> None:
         self.base_url = base_url.rstrip("/")
 
-    async def generate(self, model: str, prompt: str, timeout: float) -> str:
+    async def generate(
+        self,
+        model: str,
+        prompt: str,
+        timeout: float,
+        on_stream_update: Callable[[str, bool], Any] | None = None,
+    ) -> str:
         """Send a generation request and return the accumulated response text.
 
         Streams the response from ``POST /api/generate``, accumulating the
@@ -96,7 +102,7 @@ class OllamaClient:
                     "POST",
                     url,
                     json=payload,
-                    timeout=timeout,
+                    timeout=timeout_config,
                 ) as resp:
                     # Raise typed error for 4xx/5xx before reading the body.
                     if resp.status_code >= 400:
@@ -128,6 +134,11 @@ class OllamaClient:
                             full_response.append(response_chunk)
                         elif thinking_chunk:
                             full_response.append(thinking_chunk)
+                        if on_stream_update and (response_chunk or thinking_chunk):
+                            try:
+                                on_stream_update("".join(full_response).strip(), bool(chunk_obj.get("done")))
+                            except Exception:
+                                logger.exception("OllamaClient.stream_update_callback failed")
                         return bool(chunk_obj.get("done"))
 
                     # Prefer byte-level iteration to correctly handle servers that
@@ -201,6 +212,10 @@ class OllamaClient:
         except httpx.TimeoutException as exc:
             raise OllamaTimeoutError(
                 f"Request to Ollama timed out after {timeout}s: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise OllamaConnectionError(
+                f"Ollama transport failure while connecting to {self.base_url}: {exc}"
             ) from exc
 
     async def list_models(self) -> list[dict[str, Any]]:

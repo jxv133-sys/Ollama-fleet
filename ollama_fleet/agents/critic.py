@@ -27,6 +27,19 @@ def build_critic_prompt(
   ],
   "overall_assessment": "The divide function will crash on zero input. Fix the guard clause."
 }"""
+    schema_example_empty = """{
+  "approved": false,
+  "issues": [
+    {
+      "file_path": "src/calculator.py",
+      "line_number": 0,
+      "severity": "critical",
+      "description": "No source code generated",
+      "suggested_fix": "Generate actual Python code with implementations"
+    }
+  ],
+  "overall_assessment": "No valid source code was generated."
+}"""
 
     lines: list[str] = [
         "You are Critic_Agent. Your ONLY task is to return valid JSON.",
@@ -34,6 +47,9 @@ def build_critic_prompt(
         "RESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.",
         "",
         "CRITICAL RULES:",
+        "0. CHECK FIRST: If the code is empty, whitespace-only, or not actual source code,",
+        "   immediately reject with approved=false and an issue describing 'No source code generated'.",
+        "   Do NOT try to analyze or guess what the code should do.",
         "1. If the code is syntactically valid Python and implements the described task reasonably,",
         "   you MUST set approved=true and return an empty issues array.",
         "2. Only set approved=false if you find a SPECIFIC, CONCRETE bug — not style preferences.",
@@ -47,15 +63,19 @@ def build_critic_prompt(
         "JSON SCHEMA:",
         "- approved: boolean",
         "- issues: array (empty [] when approved=true)",
-        "  Each issue: file_path (string), line_number (integer > 0), severity ('critical'|'major'|'minor'),",
-        "               description (specific bug), suggested_fix (concrete code fix)",
+        "  Each issue: file_path (string), line_number (integer >= 0; 0 for file-level issues),",
+        "               severity ('critical'|'major'|'minor'),",
+        "               description (specific issue), suggested_fix (concrete fix)",
         "- overall_assessment: one real sentence describing your finding",
         "",
         "EXAMPLE — approved:",
         schema_example,
         "",
-        "EXAMPLE — rejected with a real issue:",
+        "EXAMPLE — rejected with a specific bug:",
         schema_example_reject,
+        "",
+        "EXAMPLE — rejected for no code generated:",
+        schema_example_empty,
         "",
         "Now review the following code:",
         "",
@@ -95,6 +115,6 @@ def build_critic_prompt(
         lines.append("If these issues are resolved, set approved=true.")
 
     lines.append("")
-    lines.append("RETURN ONLY VALID JSON. approved must be true unless you found a specific concrete bug.")
+    lines.append("RETURN ONLY VALID JSON. Check first: is there actual code? If not, reject immediately.")
 
     return "\n".join(lines)

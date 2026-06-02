@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
 
+from ollama_fleet.ui.event_bus import UIEventBus
 from pydantic import ValidationError
 
 from ollama_fleet.agents import coder as coder_module
 from ollama_fleet.agents import critic as critic_module
 from ollama_fleet.agents import planner as planner_module
+from ollama_fleet.agents import specification as specification_module
 from ollama_fleet.agents import synthesizer as synthesizer_module
 from ollama_fleet.agents import tester as tester_module
-from ollama_fleet.agents.schemas import AgentOutput, AgentType, CoderOutput, CriticOutput, PlannerOutput, SynthesizerOutput, TesterOutput
+from ollama_fleet.agents.schemas import AgentOutput, AgentType, CoderOutput, CriticOutput, PlannerOutput, SpecificationOutput, SynthesizerOutput, TesterOutput
 from ollama_fleet.config import FleetSettings
 from ollama_fleet.ollama.client import OllamaClient, OllamaTimeoutError
 
@@ -21,9 +24,29 @@ logger = logging.getLogger(__name__)
 
 
 class AgentExecutor:
-    def __init__(self, client: OllamaClient, settings: FleetSettings) -> None:
+    def __init__(self, client: OllamaClient, settings: FleetSettings, ui_bus: UIEventBus | None = None) -> None:
         self.client = client
         self.settings = settings
+        self.ui_bus = ui_bus
+
+    def _publish_agent_progress(
+        self,
+        agent_type: AgentType,
+        prompt: str,
+        partial_response: str,
+        done: bool,
+    ) -> None:
+        if not self.ui_bus:
+            return
+        self.ui_bus.publish(
+            {
+                "type": "agent_progress",
+                "agent_type": agent_type.value,
+                "prompt": prompt,
+                "partial": partial_response,
+                "done": done,
+            }
+        )
 
     async def execute(
         self,
@@ -36,10 +59,14 @@ class AgentExecutor:
         while True:
             start = time.monotonic()
             try:
+                def _stream_callback(full_response: str, done: bool) -> None:
+                    self._publish_agent_progress(agent_type, prompt, full_response, done)
+
                 raw = await self.client.generate(
                     model=self._select_model(agent_type),
                     prompt=prompt,
                     timeout=self.settings.ollama.timeout,
+                    on_stream_update=_stream_callback,
                 )
                 parsed = self._parse_output(raw, agent_type)
                 duration = time.monotonic() - start
@@ -50,7 +77,8 @@ class AgentExecutor:
                     duration,
                     len(raw),
                 )
-                return parsed
+                # Return both the parsed agent output and the prompt used
+                return parsed, prompt
             except ValidationError as exc:
                 duration = time.monotonic() - start
                 logger.warning(
@@ -96,11 +124,30 @@ class AgentExecutor:
             return planner_module.build_planner_prompt(
                 goal=task.get("goal", ""), architecture_notes=extra_context.get("architecture_notes", "")
             )
+        if agent_type == AgentType.SPECIFICATION:
+            return specification_module.build_specification_prompt(
+                task_description=task.get("description", ""),
+                file_path=extra_context.get("file_path"),
+                required_contents=extra_context.get("required_contents", []),
+                estimated_size=extra_context.get("estimated_size"),
+                goal=extra_context.get("goal", task.get("goal", "")),
+                active_files=extra_context.get("active_files", []),
+            )
         if agent_type == AgentType.CODER:
             return coder_module.build_coder_prompt(
                 task_description=task.get("description", ""),
                 active_files=extra_context.get("active_files", []),
                 episodic_summaries=extra_context.get("episodic_summaries", []),
+                file_path=extra_context.get("file_path"),
+                required_contents=extra_context.get("required_contents"),
+                estimated_size=extra_context.get("estimated_size"),
+                goal=extra_context.get("goal", task.get("goal", "")),
+                imports=extra_context.get("imports", []),
+                required_functions=extra_context.get("required_functions", []),
+                required_behavior=extra_context.get("required_behavior", []),
+                forbidden_behavior=extra_context.get("forbidden_behavior", []),
+                purpose=extra_context.get("purpose"),
+                critic_issues=extra_context.get("critic_issues", []),
             )
         if agent_type == AgentType.TESTER:
             return tester_module.build_tester_prompt(
@@ -112,6 +159,7 @@ class AgentExecutor:
                 modified_files=extra_context.get("modified_files", []),
                 file_contents=extra_context.get("file_contents", {}),
                 lint_results=extra_context.get("lint_results", []),
+                critic_issues=extra_context.get("critic_issues", []),
             )
         if agent_type == AgentType.SYNTHESIZER:
             return synthesizer_module.build_synthesizer_prompt(
@@ -155,6 +203,13 @@ class AgentExecutor:
             # Ensure agent_type exists and is valid
             if "agent_type" not in task:
                 task["agent_type"] = "coder"
+            elif isinstance(task["agent_type"], list):
+                task["agent_type"] = str(task["agent_type"][0]) if task["agent_type"] else "coder"
+            elif isinstance(task["agent_type"], dict):
+                task["agent_type"] = str(next(iter(task["agent_type"].values()), "coder"))
+            elif not isinstance(task["agent_type"], str):
+                task["agent_type"] = str(task["agent_type"])
+            task["agent_type"] = task["agent_type"].lower().replace("_agent", "")
 
             # Ensure dependencies is a list
             if "dependencies" not in task or not isinstance(task["dependencies"], list):
@@ -224,35 +279,21 @@ class AgentExecutor:
         logger.debug(f"✅ Normalized {len(data.get('tasks', []))} tasks for planner output")
         return data
 
-    def _normalize_coder_output(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Normalize Coder output: ensure required fields."""
-        # Normalize file_modifications
-        for mod in data.get("file_modifications", []):
-            if "path" in mod and "file_path" not in mod:
-                mod["file_path"] = mod.pop("path")
-            if "content" not in mod:
-                mod["content"] = ""
-            # Strip leading slash from absolute paths so the workspace manager
-            # can safely join them with the workspace root. Models sometimes
-            # return placeholder paths like "/path/to/file.py".
-            if "file_path" in mod:
-                fp = mod["file_path"]
-                if isinstance(fp, str) and fp.startswith("/"):
-                    from pathlib import Path as _Path
-                    p = _Path(fp)
-                    mod["file_path"] = str(p.relative_to(p.anchor))
-        
-        # Ensure confidence_score exists and is in range
-        if "confidence_score" not in data:
-            data["confidence_score"] = 0.5
-        else:
-            try:
-                score = float(data["confidence_score"])
-                data["confidence_score"] = max(0.0, min(1.0, score))
-            except (ValueError, TypeError):
-                data["confidence_score"] = 0.5
-        
-        return data
+    def _strip_code_fences(self, text: str) -> str:
+        """Remove markdown fenced code blocks and return the inner code."""
+        text = text.strip()
+        if text.startswith("```"):
+            fence_match = re.search(r'^```(?:\w+)?\n(.*)```$', text, re.DOTALL)
+            if fence_match:
+                return fence_match.group(1).strip()
+        block_match = re.search(r'```(?:\w+)?\n(.*?)```', text, re.DOTALL)
+        if block_match:
+            return block_match.group(1).strip()
+        return text
+
+    def _normalize_coder_output(self, raw: str) -> str:
+        """Normalize Coder output: extract the file contents from the model response."""
+        return coder_module.normalize_coder_response(raw)
 
     def _normalize_critic_output(self, data: dict[str, Any]) -> dict[str, Any]:
         """Normalize Critic output: ensure issue structure and detect placeholder responses."""
@@ -349,6 +390,10 @@ class AgentExecutor:
                 "Verify the OllamaClient streaming behavior and inspect the raw NDJSON stream (for example via curl) to diagnose the issue. "
                 f"agent_type={agent_type.value}"
             )
+        if agent_type == AgentType.CODER:
+            content = self._normalize_coder_output(raw)
+            return CoderOutput.model_validate({"content": content})
+
         # Extraction wrapper: try to extract JSON from messy output
         try:
             body = json.loads(raw)
@@ -368,9 +413,8 @@ class AgentExecutor:
         if agent_type == AgentType.PLANNER:
             body = self._normalize_planner_output(body)
             return PlannerOutput.model_validate(body)
-        if agent_type == AgentType.CODER:
-            body = self._normalize_coder_output(body)
-            return CoderOutput.model_validate(body)
+        if agent_type == AgentType.SPECIFICATION:
+            return SpecificationOutput.model_validate(body)
         if agent_type == AgentType.TESTER:
             return TesterOutput.model_validate(body)
         if agent_type == AgentType.CRITIC:
@@ -380,6 +424,7 @@ class AgentExecutor:
             body = self._normalize_synthesizer_output(body)
             return SynthesizerOutput.model_validate(body)
         raise ValueError(f"Unsupported agent type: {agent_type}")
+
 
     def _build_retry_prompt(self, prompt: str, exc: Exception) -> str:
         # Accept either a Pydantic ValidationError (has .errors()) or any
@@ -391,8 +436,10 @@ class AgentExecutor:
             details = [str(exc)]
         return (
             prompt
-            + "\n\nThe previous response failed validation. Please return valid JSON conforming to the schema."
-            + " Validation errors: "
+            + "\n\nThe previous response failed validation or parsing."
+            + " For coder tasks, please return raw file contents only." 
+            + " For all other tasks, please return valid JSON conforming to the schema."
+            + " Validation/parsing errors: "
             + json.dumps(details)
         )
 

@@ -10,6 +10,16 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
       "title": "Implement core data models",
       "description": "Create src/models.py with all data classes and type definitions needed by the application. Include docstrings and type hints.",
       "agent_type": "coder",
+      "file_path": "src/module.py",
+      "file_spec": {
+        "purpose": "Data model definitions and type hints",
+        "imports": ["from typing import TypedDict"],
+        "required_functions": [],
+        "required_behavior": ["Define data classes with type hints", "Include __repr__ for debugging"],
+        "forbidden_behavior": ["Create side-effectful global state", "Invent top-level CLI behavior"]
+      },
+      "required_contents": ["ClassName", "function_name()", "type hints for all functions"],
+      "estimated_size": "small",
       "dependencies": [],
       "priority": 1
     },
@@ -19,6 +29,9 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
       "title": "Implement business logic",
       "description": "Create src/logic.py with the main application logic. Import from models.py. Handle edge cases and errors.",
       "agent_type": "coder",
+      "file_path": "src/logic.py",
+      "required_contents": ["process_request()", "handle_errors()"],
+      "estimated_size": "medium",
       "dependencies": ["task_001"],
       "priority": 2
     },
@@ -28,26 +41,23 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
       "title": "Implement CLI entry point",
       "description": "Create main.py as the runnable entry point. Import from src/logic.py. Add argument parsing and user-facing output.",
       "agent_type": "coder",
+      "file_path": "main.py",
+      "required_contents": ["if __name__ == '__main__'", "argparse usage"],
+      "estimated_size": "small",
       "dependencies": ["task_002"],
       "priority": 3
     },
     {
       "task_id": "task_004",
       "step_number": 4,
-      "title": "Write unit tests",
-      "description": "Create tests/test_logic.py with pytest tests covering the main functions in src/logic.py. Test normal cases and edge cases.",
-      "agent_type": "tester",
+      "title": "Add CLI helper module",
+      "description": "Create src/cli.py with command parsing helpers and output formatting utilities. main.py should import these helpers.",
+      "agent_type": "coder",
+      "file_path": "src/cli.py",
+      "required_contents": ["parse_args()", "format_output()"],
+      "estimated_size": "small",
       "dependencies": ["task_002"],
       "priority": 4
-    },
-    {
-      "task_id": "task_005",
-      "step_number": 5,
-      "title": "Summarize completed project",
-      "description": "Review all produced files and write a summary of what was built, how to run it, and what was accomplished.",
-      "agent_type": "synthesizer",
-      "dependencies": ["task_003", "task_004"],
-      "priority": 5
     }
   ],
   "clarifying_questions": [],
@@ -67,33 +77,38 @@ def build_planner_prompt(goal: str, architecture_notes: str) -> str:
 }"""
 
     return (
-        "You are Planner_Agent. Your ONLY task is to return valid JSON.\n"
-        "\nRESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.\n"
-        "\n=== PLANNING RULES ===\n"
-        "1. DECOMPOSE the goal into 3-7 focused tasks. Each task should produce one or more specific files.\n"
-        "2. EVERY build/create/implement goal MUST have multiple coder tasks — one per logical module or file group.\n"
-        "   Do NOT put everything in a single coder task.\n"
-        "3. Task descriptions must be SPECIFIC: name the exact files to create, what functions/classes to implement,\n"
-        "   and what the file should import from other tasks.\n"
-        "4. Use DEPENDENCIES to order tasks correctly. Later tasks that import from earlier ones must list them.\n"
-        "5. Include a tester task (agent_type='tester') that writes pytest tests for the core logic.\n"
-        "6. End with a synthesizer task (agent_type='synthesizer') that depends on all coder/tester tasks.\n"
-        "7. Synthesizer tasks MUST depend on coder tasks — never make synthesizer the first or only task.\n"
-        "8. clarifying_questions: array of strings. If details are missing, ask concise follow-up questions. "
-        "If no clarification is needed, return an empty list.\n"
-        "9. technical_requirements: array of strings describing exact libraries, frameworks, file structure, and quality expectations.\n"
-        "10. milestones: array of plain strings describing each phase of completion.\n"
-        "11. architecture_notes: one paragraph describing the file structure, module layout, and design decisions.\n"
-        "12. **CRITICAL: Every task MUST have a step_number field (integer, starting from 1, incrementing by 1 for each task). "
-        "step_number defines the sequential order of task execution.**\n"
-        "\n=== AGENT TYPES ===\n"
-        "- 'coder': writes or modifies source files\n"
-        "- 'tester': writes pytest test files\n"
-        "- 'synthesizer': summarizes completed work (always last, always depends on coders)\n"
-        "\n=== EXAMPLE OUTPUT (for a calculator goal) ===\n"
-        + schema_example
-        + "\n\n=== NOW PLAN THIS GOAL ===\n"
-        "Goal: " + goal + "\n"
+        "You are a software project planning agent.\n"
+        "\nYour job is to break a software project into implementation tasks.\n"
+        "\nFocus on:\n"
+        "- What files need to be created\n"
+        "- What each file is responsible for\n"
+        "- Dependencies between files\n"
+        "- Required functions and classes\n"
+        "\nDo NOT write code.\n"
+        "\nDo NOT explain your reasoning.\n"
+        "\nReturn ONLY valid JSON.\n"
+        "\nResponse format:\n"
+        "{\n"
+        "  \"project_summary\": \"short summary\",\n"
+        "  \"tasks\": [\n"
+        "    {\n"
+        "      \"title\": \"task name\",\n"
+        "      \"file_path\": \"path/to/file.py\",\n"
+        "      \"purpose\": \"what this file does\",\n"
+        "      \"depends_on\": [],\n"
+        "      \"requirements\": [\n"
+        "        \"requirement 1\",\n"
+        "        \"requirement 2\"\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "\nRules:\n"
+        "- Create one task per file.\n"
+        "- Use exact file paths when possible.\n"
+        "- Keep requirements specific.\n"
+        "- Do not invent unnecessary files.\n"
+        "- Return only JSON.\n"
+        "\nGoal: " + goal + "\n"
         + ("Architecture notes: " + architecture_notes + "\n" if architecture_notes else "")
-        + "\nThink through the full file structure needed, then return ONLY the JSON object."
     )
