@@ -264,9 +264,17 @@ class OllamaFleetDashboard(App):
         elif t == "agent_output":
             agent = event.get("agent_type", "?")
             output = event.get("output", "")
+            raw_response = ""
             if isinstance(output, dict):
-                output = json.dumps(output, indent=2)[:500]
+                raw_response = output.get("raw_response", "")
+                clean_output = {k: v for k, v in output.items() if k != "raw_response"}
+                output = json.dumps(clean_output, indent=2)[:500]
             self.raw_output.write_line(f"[yellow]{agent}[/yellow]: {output}")
+            if raw_response:
+                self.raw_output.write_line(f"[bold yellow]── {agent} RAW RESPONSE ──[/bold yellow]")
+                for line in str(raw_response).splitlines():
+                    self.raw_output.write_line(f"[yellow]{line}[/yellow]")
+                self.raw_output.write_line(f"[bold yellow]── END RAW RESPONSE ──[/bold yellow]")
 
         elif t == "task_state_changed":
             tid = event.get("task_id")

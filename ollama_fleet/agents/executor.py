@@ -65,7 +65,7 @@ class AgentExecutor:
         task: dict[str, Any],
         agent_type: AgentType,
         extra_context: dict[str, Any] | None = None,
-    ) -> AgentOutput:
+    ) -> tuple[AgentOutput, str, str]:
         prompt = self._build_prompt(task, agent_type, extra_context or {})
         retries = 0
         while True:
@@ -91,8 +91,8 @@ class AgentExecutor:
                     duration,
                     len(raw),
                 )
-                # Return both the parsed agent output and the prompt used
-                return parsed, prompt
+                # Return both the parsed agent output, the prompt used, and the raw response text
+                return parsed, prompt, raw
             except ValidationError as exc:
                 duration = time.monotonic() - start
                 logger.warning(
@@ -426,15 +426,8 @@ class AgentExecutor:
 
         Expected format per task:
             N. filename.py — Short title
-               PURPOSE: ...
-               EXPORTS: ...
-               IMPORTS: ...
-               FUNCTIONS:
-                 - name(params) -> type: description
-               BEHAVIOR: ...
-               LINES: 100
-               DEPENDS ON: 1, 2  (or "(none)")
-               PRIORITY: 1
+               PURPOSE: What this file does
+               DEPENDS ON: filename.py, other_file.py, or (none)
         """
         tasks: list[dict[str, Any]] = []
 
@@ -466,75 +459,23 @@ class AgentExecutor:
                 m = re.search(rf'^\s*{field}\s*:\s*(.+)', block, re.MULTILINE | re.IGNORECASE)
                 return m.group(1).strip() if m else ""
 
-            def _extract_multiline(field: str) -> str:
-                """Pull everything after 'FIELD:' until the next ALL-CAPS field."""
-                m = re.search(
-                    rf'^\s*{field}\s*:\s*\n?(.*?)(?=\n\s*[A-Z][A-Z ]+\s*:|$)',
-                    block,
-                    re.MULTILINE | re.IGNORECASE | re.DOTALL,
-                )
-                return m.group(1).strip() if m else ""
-
+            # Extract only PURPOSE and DEPENDS ON from simplified format
             purpose = _extract("PURPOSE")
-            exports_raw = _extract("EXPORTS")
-            imports_raw = _extract("IMPORTS")
-            behavior = _extract_multiline("BEHAVIOR")
-            lines_raw = _extract("LINES")
             depends_raw = _extract("DEPENDS ON")
-            priority_raw = _extract("PRIORITY")
 
-            # Parse functions block
-            functions_text = _extract_multiline("FUNCTIONS")
-            functions: list[dict[str, Any]] = []
-            for fn_line in functions_text.splitlines():
-                fn_line = fn_line.strip().lstrip("- ").strip()
-                if not fn_line:
-                    continue
-                fn_match = re.match(r'(\w+)\s*\(([^)]*)\)\s*->\s*(\S+):\s*(.*)', fn_line)
-                if fn_match:
-                    functions.append({
-                        "name": fn_match.group(1),
-                        "params": [p.strip() for p in fn_match.group(2).split(",") if p.strip()],
-                        "returns": fn_match.group(3),
-                        "docstring": fn_match.group(4).strip(),
-                    })
-                else:
-                    # Class or free-form entry
-                    class_match = re.match(r'(\w+)\s*\(class\):\s*(.*)', fn_line, re.IGNORECASE)
-                    if class_match:
-                        functions.append({"name": class_match.group(1), "type": "class", "docstring": class_match.group(2).strip()})
-                    elif fn_line:
-                        functions.append({"name": fn_line.split("(")[0].strip()})
-
-            # Parse estimated lines
-            try:
-                estimated_lines = int(re.search(r'\d+', lines_raw).group()) if lines_raw else 100
-            except (AttributeError, ValueError):
-                estimated_lines = 100
-
-            # Parse dependencies: reference by task step number → convert to task_id strings
+            # Parse dependencies: can be filenames or task step numbers
             dependencies: list[str] = []
             if depends_raw and depends_raw.lower() not in ("(none)", "none", ""):
                 for part in re.split(r'[,\s]+', depends_raw):
                     part = part.strip()
                     if re.match(r'^\d+$', part):
+                        # Task step number → convert to task_id
                         dependencies.append(f"task_{int(part):03d}")
+                    elif part.endswith(".py") and part.lower() not in ("none", "(none)"):
+                        # Filename reference
+                        dependencies.append(part)
                     elif part and part.lower() not in ("none", "(none)"):
                         dependencies.append(part)
-
-            # Parse priority
-            try:
-                priority = int(re.search(r'\d+', priority_raw).group()) if priority_raw else step
-            except (AttributeError, ValueError):
-                priority = step
-
-            # Parse imports
-            imports: list[str] = []
-            if imports_raw and imports_raw.lower() not in ("(none)", "none", ""):
-                for imp in imports_raw.split(","):
-                    imp = imp.strip()
-                    if imp:
-                        imports.append(imp)
 
             task_id = f"task_{step:03d}"
             task: dict[str, Any] = {
@@ -544,16 +485,10 @@ class AgentExecutor:
                 "description": purpose or title,
                 "agent_type": "coder",
                 "dependencies": dependencies,
-                "priority": priority,
+                "priority": step,
                 "filename": filename,
-                "file_spec": {
-                    "purpose": purpose,
-                    "public_exports": [e.strip() for e in exports_raw.split(",") if e.strip()] if exports_raw else [],
-                    "imports": imports,
-                    "functions": functions,
-                    "exact_content": behavior,
-                    "estimated_lines": estimated_lines,
-                },
+                # Note: file_spec details will be provided by the File Specification Agent
+                "file_spec": None,
             }
             tasks.append(task)
 

@@ -329,8 +329,7 @@ def create_app(state: AppState) -> FastAPI:
     # REST — file browser: list workspace files for a job
     # -----------------------------------------------------------------------
     @app.get("/api/jobs/{job_id}/files")
-    async def list_workspace_files(job_id: str) -> dict[str, Any]:
-        # Resolve db_path to absolute so sqlite3 finds it regardless of cwd
+    def _resolve_workspace_root(job_id: str) -> Path | None:
         db_path = state.db_path.resolve()
         ws_root: Path | None = None
         try:
@@ -343,9 +342,8 @@ def create_app(state: AppState) -> FastAPI:
                 if candidate.exists():
                     ws_root = candidate
         except sqlite3.Error as e:
-            logger.error(f"DB error listing files for {job_id[:8]}: {e}")
+            logger.error(f"DB error resolving workspace for {job_id[:8]}: {e}")
 
-        # Fallback: scan workspaces/ directory by job_id if DB path is stale
         if ws_root is None:
             settings_base = Path(
                 state.orchestrator.settings.workspace.base_path
@@ -355,6 +353,10 @@ def create_app(state: AppState) -> FastAPI:
             if candidate.exists():
                 ws_root = candidate
 
+        return ws_root
+
+    async def list_workspace_files(job_id: str) -> dict[str, Any]:
+        ws_root = _resolve_workspace_root(job_id)
         if ws_root is None:
             return {"error": "Workspace not found", "files": []}
 
@@ -375,21 +377,36 @@ def create_app(state: AppState) -> FastAPI:
             })
         return {"workspace": str(ws_root), "files": files}
 
+    @app.get("/api/jobs/{job_id}/agent_outputs")
+    async def list_agent_outputs(job_id: str) -> dict[str, Any]:
+        ws_root = _resolve_workspace_root(job_id)
+        if ws_root is None:
+            return {"error": "Workspace not found", "outputs": []}
+
+        outputs_dir = ws_root / "agent_outputs"
+        if not outputs_dir.exists() or not outputs_dir.is_dir():
+            return {"outputs": []}
+
+        outputs: list[dict[str, Any]] = []
+        for p in sorted(outputs_dir.glob("*.json")):
+            try:
+                raw_text = p.read_text(encoding="utf-8")
+                data = json.loads(raw_text)
+                outputs.append({
+                    "file": p.name,
+                    "agent_type": data.get("agent_type"),
+                    "timestamp": data.get("timestamp"),
+                    "output": data,
+                })
+            except Exception:
+                continue
+        return {"outputs": outputs}
+
     @app.get("/api/jobs/{job_id}/files/{file_path:path}")
     async def read_workspace_file(job_id: str, file_path: str) -> dict[str, Any]:
-        db_path = state.db_path.resolve()
-        ws_root: Path | None = None
-        try:
-            with sqlite3.connect(str(db_path), timeout=2.0) as conn:
-                row = conn.execute(
-                    "SELECT workspace_path FROM jobs WHERE job_id = ?", (job_id,)
-                ).fetchone()
-            if row and row[0]:
-                candidate = Path(row[0])
-                if candidate.exists():
-                    ws_root = candidate
-        except sqlite3.Error as e:
-            logger.error(f"DB error reading file {file_path}: {e}")
+        ws_root = _resolve_workspace_root(job_id)
+        if ws_root is None:
+            return {"error": "Workspace not found"}
 
         # Fallback: scan workspaces/ directory by job_id
         if ws_root is None:
@@ -762,7 +779,9 @@ function onAgentOutput(ev) {
   // Store interaction in state
   state.interactions.push({
     agent: cap(agent),
-    response: response
+    prompt: out.prompt || "",
+    response: response,
+    raw_response: out.raw_response || "",
   });
 
   if (["planner","coder","critic","tester","synthesizer"].includes(agent)) {
@@ -806,14 +825,10 @@ function onAgentProgress(ev) {
   updateSummaryPanel();
 }
 
-function onPromptSent(ev) {
-  const agent = (ev.agent_type || "?").toLowerCase();
-  const prompt = ev.prompt || "";
+function appendPromptBlock(agent, prompt) {
   if (!prompt) return;
-
-  // Show the prompt in the chat panel as a collapsible block
-  const chat = document.getElementById("chat");
-  if (!chat) return;
+  const content = document.getElementById("ai-summary-content");
+  if (!content) return;
 
   const msgEl = document.createElement("div");
   msgEl.className = "chat-msg";
@@ -849,10 +864,16 @@ function onPromptSent(ev) {
 
   msgEl.appendChild(header);
   msgEl.appendChild(body);
-  chat.appendChild(msgEl);
-  chat.scrollTop = chat.scrollHeight;
+  content.appendChild(msgEl);
+  if (_isScrolledToBottom(content)) content.scrollTop = content.scrollHeight;
+}
 
-  // Also log a one-liner to the log panel
+function onPromptSent(ev) {
+  const agent = (ev.agent_type || "?").toLowerCase();
+  const prompt = ev.prompt || "";
+  if (!prompt) return;
+
+  appendPromptBlock(agent, prompt);
   appendLog(`[${agent.toUpperCase()}] prompt sent (${prompt.length} chars)`, "debug");
 }
 
@@ -1052,6 +1073,7 @@ async function selectJob(jobId) {
     };
   }
   renderTasks();
+  await renderAgentOutputs(jobId);
   refreshFileBrowser(jobId);
 }
 
@@ -1175,48 +1197,101 @@ function formatAgentMsg(out) {
   if (typeof out !== "object" || out === null) return String(out);
 
   const payload = { ...out };
+  const rawResponse = payload.raw_response ? String(payload.raw_response) : "";
   delete payload.prompt;
+  delete payload.raw_response;
 
+  let summaryText = "";
   if (payload.tests_passed !== undefined) {
-    return `Tests passed: ${payload.tests_passed}, failed: ${payload.tests_failed || 0}, ready_for_review: ${payload.ready_for_review}`;
-  }
-  if (payload.approved !== undefined) {
+    summaryText = `Tests passed: ${payload.tests_passed}, failed: ${payload.tests_failed || 0}, ready_for_review: ${payload.ready_for_review}`;
+  } else if (payload.approved !== undefined) {
     const issues = payload.issues ? payload.issues.length : 0;
-    return `Approved: ${payload.approved ? "yes" : "no"}, issues: ${issues}, assessment: ${payload.overall_assessment || ""}`.slice(0, 200);
-  }
-  if (payload.file_path) {
-    return `Generated: ${payload.file_path}`;
-  }
-  if (payload.file_count !== undefined) {
+    summaryText = `Approved: ${payload.approved ? "yes" : "no"}, issues: ${issues}, assessment: ${payload.overall_assessment || ""}`.slice(0, 200);
+  } else if (payload.file_path) {
+    summaryText = `Generated: ${payload.file_path}`;
+  } else if (payload.file_count !== undefined) {
     const fp = payload.file_path ? ` (${payload.file_path})` : "";
-    return `Generated ${payload.file_count} file${payload.file_count !== 1 ? "s" : ""}${fp}`;
-  }
-  if (Array.isArray(payload.files_produced) && payload.files_produced.length) {
-    return `Files created: ${payload.files_produced.slice(0,5).join(", ")}`;
-  }
-  if (Array.isArray(payload.files_created) && payload.files_created.length) {
-    return `Files created: ${payload.files_created.slice(0,5).join(", ")}`;
-  }
-  if (payload.summary) {
-    let summaryText = payload.summary;
+    summaryText = `Generated ${payload.file_count} file${payload.file_count !== 1 ? "s" : ""}${fp}`;
+  } else if (Array.isArray(payload.files_produced) && payload.files_produced.length) {
+    summaryText = `Files created: ${payload.files_produced.slice(0,5).join(", ")}`;
+  } else if (Array.isArray(payload.files_created) && payload.files_created.length) {
+    summaryText = `Files created: ${payload.files_created.slice(0,5).join(", ")}`;
+  } else if (payload.summary) {
+    summaryText = payload.summary;
     if (Array.isArray(payload.files_produced) && payload.files_produced.length) {
       summaryText += "\nFiles: " + payload.files_produced.slice(0,5).join(", ");
     }
-    return summaryText.slice(0, 300);
-  }
-  if (payload.tasks_created !== undefined) {
+    summaryText = summaryText.slice(0, 300);
+  } else if (payload.tasks_created !== undefined) {
     const ms = (payload.milestones || []).slice(0,3).join("; ");
-    return `Created ${payload.tasks_created} tasks. Milestones: ${ms}`;
+    summaryText = `Created ${payload.tasks_created} tasks. Milestones: ${ms}`;
+  } else if (payload.architecture !== undefined) {
+    summaryText = `Architecture: ${payload.architecture.slice(0, 150)}...`;
+  } else {
+    summaryText = JSON.stringify(payload).slice(0,150);
   }
-  if (payload.architecture !== undefined) {
-    return `Architecture: ${payload.architecture.slice(0, 150)}...`;
+
+  if (rawResponse) {
+    return `${summaryText}\n\nRaw response:\n${rawResponse}`;
   }
-  return JSON.stringify(payload).slice(0,150);
+  return summaryText;
 }
 
 function shortPrompt(prompt) {
   const lines = String(prompt).split(/\r?\n/).filter(Boolean);
   return lines.slice(0, 10).join("\n");
+}
+
+function clearSummaryPanel() {
+  const content = document.getElementById('ai-summary-content');
+  if (!content) return;
+  content.innerHTML = '';
+}
+
+async function renderAgentOutputs(jobId) {
+  const content = document.getElementById('ai-summary-content');
+  if (!content) return;
+  clearSummaryPanel();
+  state.interactions = [];
+  state.iterations = 0;
+  state.testStatus = 'pending';
+  state.liveResponse = null;
+  updateSummaryPanel();
+
+  const data = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/agent_outputs`).then(r => r.json()).catch(() => ({ outputs: [], error: 'fetch failed' }));
+  if (data.error) {
+    content.innerHTML = `<div style="color:var(--muted);text-align:center;padding:20px">${escHtml(data.error)}</div>`;
+    return;
+  }
+  if (!Array.isArray(data.outputs) || !data.outputs.length) {
+    content.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">No saved agent outputs for this job.</div>';
+    return;
+  }
+
+  let status = 'pending';
+  for (const record of data.outputs) {
+    const out = record.output || {};
+    const agent = (record.agent_type || out.agent_type || '?').toLowerCase();
+    if (out.prompt) appendPromptBlock(agent, out.prompt);
+    const response = formatAgentMsg(out);
+    appendChat(cap(agent), response, agent);
+    state.interactions.push({
+      agent: cap(agent),
+      prompt: out.prompt || '',
+      response: response,
+      raw_response: out.raw_response || '',
+    });
+    state.iterations += 1;
+
+    if (typeof out.tests_passed !== 'undefined') {
+      status = out.tests_failed ? `Failed (${out.tests_failed} failed)` : `Passed (${out.tests_passed} passed)`;
+    }
+    if (typeof out.approved !== 'undefined') {
+      status = out.approved ? 'Critic approved' : 'Critic requested changes';
+    }
+  }
+  state.testStatus = status;
+  updateSummaryPanel();
 }
 
 function addFileChange(path) {

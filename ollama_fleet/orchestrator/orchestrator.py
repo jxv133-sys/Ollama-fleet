@@ -135,6 +135,7 @@ class Orchestrator:
                 "milestones": planner_output.milestones,
                 "architecture": planner_output.architecture_notes[:100] if planner_output.architecture_notes else "",
                 "prompt": planner_prompt,
+                "raw_response": raw,
             }
         })
         
@@ -148,6 +149,7 @@ class Orchestrator:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_type": AgentType.PLANNER.value,
             "prompt": planner_prompt,
+            "raw_response": raw,
             "tasks_created": len(tasks),
             "milestones": planner_output.milestones,
             "architecture_notes": planner_output.architecture_notes,
@@ -342,7 +344,7 @@ class Orchestrator:
 
     async def _run_planner(self, goal: str) -> tuple[PlannerOutput, str]:
         try:
-            parsed, prompt = await self.executor.execute(
+            parsed, prompt, raw = await self.executor.execute(
                 {
                     "task_id": "planner",
                     "goal": goal,
@@ -511,7 +513,7 @@ class Orchestrator:
         extra_context["active_files"] = memory_context.active_files
         extra_context["episodic_summaries"] = memory_context.episodic_summaries
 
-        coder_output, coder_prompt = await self.executor.execute(
+        coder_output, coder_prompt, coder_raw = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -529,6 +531,7 @@ class Orchestrator:
                 "file_count": 1 if isinstance(coder_output, CoderOutput) else 0,
                 "file_path": file_path or "",
                 "prompt": coder_prompt,
+                "raw_response": coder_raw,
             },
         })
 
@@ -606,6 +609,7 @@ class Orchestrator:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "agent_type": AgentType.CODER.value,
             "prompt": coder_prompt,
+            "raw_response": coder_raw,
             "task_id": task.task_id,
             "file_path": rel_path,
             "content_preview": coder_output.content[:200] if len(coder_output.content) > 200 else coder_output.content,
@@ -694,7 +698,7 @@ class Orchestrator:
             })
             return
 
-        critic_output, critic_prompt = await self.executor.execute(
+        critic_output, critic_prompt, critic_raw = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -721,6 +725,7 @@ class Orchestrator:
                 "issues_found": len(critic_output.issues) if isinstance(critic_output, CriticOutput) else 0,
                 "assessment": critic_output.overall_assessment if isinstance(critic_output, CriticOutput) else "",
                 "prompt": critic_prompt,
+                "raw_response": critic_raw,
             }
         })
         
@@ -730,6 +735,7 @@ class Orchestrator:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "agent_type": AgentType.CRITIC.value,
                 "prompt": critic_prompt,
+                "raw_response": critic_raw,
                 "task_id": task.task_id,
                 "approved": critic_output.approved,
                 "overall_assessment": critic_output.overall_assessment,
@@ -862,7 +868,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("Failed to run tests for workspace: %s", exc)
 
-        tester_output, tester_prompt = await self.executor.execute(
+        tester_output, tester_prompt, tester_raw = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": "",
@@ -881,9 +887,31 @@ class Orchestrator:
                         "tests_failed": tester_output.tests_failed,
                         "ready_for_review": tester_output.ready_for_review,
                         "prompt": tester_prompt,
+                        "raw_response": tester_raw,
                     },
                 }
             )
+            # Save tester output to workspace
+            job = await self.job_manager.get_job(task.job_id)
+            if job is not None:
+                try:
+                    workspace_manager = WorkspaceManager(job.workspace_path)
+                    tester_count = len(list(workspace_manager.root.glob("agent_outputs/tester_*.json"))) + 1
+                    tester_output_data = {
+                        "timestamp": datetime.now().isoformat(),
+                        "agent_type": AgentType.TESTER.value,
+                        "prompt": tester_prompt,
+                        "raw_response": tester_raw,
+                        "tests_passed": tester_output.tests_passed,
+                        "tests_failed": tester_output.tests_failed,
+                        "ready_for_review": tester_output.ready_for_review,
+                    }
+                    workspace_manager.write_file(
+                        f"agent_outputs/tester_{tester_count}.json",
+                        json.dumps(tester_output_data, indent=2),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to save tester output: %s", exc)
         await self.scheduler.transition(task.task_id, "completed")
         self._publish_event(
             {
@@ -918,7 +946,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning("Failed to assemble episodic memory for synthesizer: %s", exc)
 
-        synthesizer_output, synthesizer_prompt = await self.executor.execute(
+        synthesizer_output, synthesizer_prompt, synthesizer_raw = await self.executor.execute(
             {
                 "task_id": task.task_id,
                 "goal": goal,
@@ -940,9 +968,29 @@ class Orchestrator:
                         "summary": synthesizer_output.summary,
                         "files_produced": synthesizer_output.files_produced,
                         "prompt": synthesizer_prompt,
+                        "raw_response": synthesizer_raw,
                     },
                 }
             )
+            # Save synthesizer output to workspace
+            if job is not None:
+                try:
+                    ws = WorkspaceManager(job.workspace_path)
+                    synthesizer_count = len(list(ws.root.glob("agent_outputs/synthesizer_*.json"))) + 1
+                    synthesizer_output_data = {
+                        "timestamp": datetime.now().isoformat(),
+                        "agent_type": AgentType.SYNTHESIZER.value,
+                        "prompt": synthesizer_prompt,
+                        "raw_response": synthesizer_raw,
+                        "summary": synthesizer_output.summary,
+                        "files_produced": synthesizer_output.files_produced,
+                    }
+                    ws.write_file(
+                        f"agent_outputs/synthesizer_{synthesizer_count}.json",
+                        json.dumps(synthesizer_output_data, indent=2),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to save synthesizer output: %s", exc)
 
         await self.scheduler.transition(task.task_id, "completed")
         self._publish_event(
