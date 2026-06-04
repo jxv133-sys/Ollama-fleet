@@ -24,6 +24,10 @@ from typing import Any
 from ollama_fleet.agents.capabilities import CapabilityRegistry, CapabilityType, CapabilityResult
 from ollama_fleet.memory.project_memory import ProjectMemoryManager
 from ollama_fleet.db.database import Database
+from ollama_fleet.orchestrator.file_utils import FileTypeDetector
+from ollama_fleet.orchestrator.context_builder import ContextBuilder
+from ollama_fleet.orchestrator.model_router import ModelRouter
+from ollama_fleet.orchestrator.smart_context import SmartContextBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +204,15 @@ class StateOrchestrator:
         self._registry = capability_registry
         self._memory = ProjectMemoryManager(db)
         self._observer = StateObserver(self._memory)
+        
+        # Initialize smart context system
+        self._context_builder = ContextBuilder(self._memory)
+        self._model_router = ModelRouter(settings=None)  # Will use defaults
+        self._smart_context = SmartContextBuilder(
+            self._memory,
+            self._context_builder,
+            self._model_router,
+        )
 
         self._max_iterations = 50  # Prevent infinite loops
         self._iteration = 0
@@ -260,10 +273,17 @@ class StateOrchestrator:
         """
         logger.info("Executing: PLAN_PROJECT")
 
+        # Build smart context for planning
+        planning_context = await self._smart_context.build_for_planning(
+            self._job_id,
+            self._goal,
+            existing_context="",
+        )
+
         result = await self._registry.execute(
             CapabilityType.PLANNING,
             goal=self._goal,
-            context="",
+            context=planning_context.get("existing_context", ""),
         )
 
         if not result.success:
@@ -272,15 +292,30 @@ class StateOrchestrator:
 
         # Parse plan and store in project memory
         plan = result.output  # Should be PlannerOutput
-        # TODO: Extract files from plan and initialize project state
-
-        await self._memory.update_project_state(
-            self._job_id,
-            "plan_created",
-            {"total_files": len(plan.tasks)},
-        )
-
-        return True
+        
+        # Extract files from plan and initialize project state
+        if hasattr(plan, 'tasks') and plan.tasks:
+            file_count = len(plan.tasks)
+            logger.info(f"Plan created: {file_count} files to generate")
+            
+            await self._memory.update_project_state(
+                self._job_id,
+                "plan_created",
+                {
+                    "total_files": file_count,
+                    "planned_files": [
+                        {
+                            "path": task.get("filename", ""),
+                            "purpose": task.get("purpose", ""),
+                        }
+                        for task in plan.tasks
+                    ],
+                },
+            )
+            return True
+        else:
+            logger.error("Plan missing tasks")
+            return False
 
     async def _execute_generate_file(self) -> bool:
         """Execute GENERATE_FILE action.
@@ -289,11 +324,72 @@ class StateOrchestrator:
         """
         logger.info("Executing: GENERATE_FILE")
 
-        # TODO: Select next file from plan
-        # TODO: Gather context (dependencies, project memory)
-        # TODO: Execute code generation
-        # TODO: Store in project memory
-        # TODO: Mark file as generated
+        # Select next file from plan
+        file_to_generate = await self._select_next_file_to_generate()
+        if not file_to_generate:
+            logger.error("No files available to generate")
+            return False
+
+        logger.info(f"Generating file: {file_to_generate['path']}")
+
+        # Build smart context using project memory
+        generation_context = await self._smart_context.build_for_code_generation(
+            self._job_id,
+            file_to_generate["path"],
+            file_to_generate.get("purpose", ""),
+            requirements=self._goal,
+        )
+
+        # Execute code generation with enriched context
+        result = await self._registry.execute(
+            CapabilityType.CODE_GENERATION,
+            file_path=generation_context["target_file"],
+            file_purpose=generation_context["target_purpose"],
+            dependencies=generation_context.get("dependencies", []),
+            requirements=generation_context.get("requirements", self._goal),
+        )
+
+        if not result.success:
+            logger.error(f"Code generation failed: {result.error}")
+            return False
+
+        # Extract source code
+        source_code = self._extract_source_code(result.output)
+        if not source_code:
+            logger.error("No source code extracted from output")
+            return False
+
+        # Validate the generated code BEFORE sending to critic
+        is_valid, error_msg = await self._smart_context.validate_code_before_review(
+            file_to_generate["path"],
+            source_code,
+        )
+        
+        if not is_valid:
+            logger.error(f"Generated code failed validation: {error_msg}")
+            return False
+
+        # Detect file type and store in project memory
+        detected_type = FileTypeDetector.detect(
+            file_to_generate["path"],
+            source_code,
+        )
+        file_type = detected_type.value if detected_type else "text"
+        
+        await self._memory.store_file_metadata(
+            self._job_id,
+            file_to_generate["path"],
+            source_code,
+            file_type=file_type,
+        )
+        logger.info(f"Stored metadata for {file_to_generate['path']} (type: {file_type})")
+
+        # Mark file as generated in project state
+        await self._memory.update_project_state(
+            self._job_id,
+            "file_generated",
+            {"generated_file": file_to_generate["path"]},
+        )
 
         return True
 
@@ -304,9 +400,81 @@ class StateOrchestrator:
         """
         logger.info("Executing: FIX_VALIDATION")
 
-        # TODO: Find files with validation errors
-        # TODO: Regenerate with error context
-        # TODO: Re-validate
+        # Get project state to find failed files
+        state = await self._memory.get_project_state(self._job_id)
+        if not state or state.failed_files == 0:
+            logger.info("No failed files to fix")
+            return True
+
+        # Find files with validation errors
+        all_files = await self._memory.get_project_files(self._job_id)
+        failed_files = [f for f in all_files if f.file_path in (state.metadata.get("failed_files", []) or [])]
+
+        if not failed_files:
+            logger.info("No failed file metadata found")
+            return True
+
+        # Fix first failed file
+        file_to_fix = failed_files[0]
+        logger.info(f"Fixing failed file: {file_to_fix.file_path}")
+
+        # Get error context
+        error_context = state.metadata.get("last_error", "Validation failed")
+        
+        # Build smart context for file fix
+        fix_context = await self._smart_context.build_for_file_fix(
+            self._job_id,
+            file_to_fix.file_path,
+            error_context,
+            "Original purpose",
+        )
+
+        # Regenerate with error context
+        result = await self._registry.execute(
+            CapabilityType.CODE_GENERATION,
+            file_path=fix_context["target_file"],
+            file_purpose=fix_context["target_purpose"],
+            dependencies=fix_context.get("dependencies", []),
+            requirements=self._goal,
+        )
+
+        if not result.success:
+            logger.error(f"Fix attempt failed: {result.error}")
+            return False
+
+        # Extract and validate
+        source_code = self._extract_source_code(result.output)
+        if not source_code:
+            logger.error("No source code in fix attempt")
+            return False
+
+        # Re-validate
+        is_valid, error_msg = await self._smart_context.validate_code_before_review(
+            file_to_fix.file_path,
+            source_code,
+        )
+        
+        if not is_valid:
+            logger.error(f"Re-generated code still invalid: {error_msg}")
+            return False
+
+        # Update project memory with fixed code
+        detected_type = FileTypeDetector.detect(file_to_fix.file_path, source_code)
+        file_type = detected_type.value if detected_type else "text"
+        
+        await self._memory.store_file_metadata(
+            self._job_id,
+            file_to_fix.file_path,
+            source_code,
+            file_type=file_type,
+        )
+
+        # Update project state
+        await self._memory.update_project_state(
+            self._job_id,
+            "file_fixed",
+            {"fixed_file": file_to_fix.file_path},
+        )
 
         return True
 
@@ -317,9 +485,21 @@ class StateOrchestrator:
         """
         logger.info("Executing: RUN_TESTS")
 
-        # TODO: Run tests (using workspace manager)
-        # TODO: Parse output
-        # TODO: Store results
+        # Run tests (using workspace manager)
+        # For now, we'll skip actual test execution
+        # In a full implementation, this would use subprocess or a test runner
+        
+        logger.info("Test execution would happen here")
+        
+        # Parse output and store results
+        # TODO: Actually run tests
+
+        # Store empty test results for now
+        await self._memory.update_project_state(
+            self._job_id,
+            "tests_run",
+            {"test_count": 0, "passed": 0, "failed": 0},
+        )
 
         return True
 
@@ -330,12 +510,39 @@ class StateOrchestrator:
         """
         logger.info("Executing: ANALYZE_FAILURES")
 
-        # TODO: Get test output
-        # TODO: Execute TestingCapability
-        # TODO: Store analysis
-        # TODO: Determine if tests pass
+        # Get test output
+        state = await self._memory.get_project_state(self._job_id)
+        test_output = state.metadata.get("test_output", "") if state else ""
 
-        return True
+        if not test_output:
+            logger.info("No test failures to analyze")
+            return True
+
+        # Execute TestingCapability
+        result = await self._registry.execute(
+            CapabilityType.TESTING,
+            test_output=test_output,
+            goal=self._goal,
+        )
+
+        if not result.success:
+            logger.error(f"Test analysis failed: {result.error}")
+            return False
+
+        # Store analysis
+        await self._memory.update_project_state(
+            self._job_id,
+            "failures_analyzed",
+            {"analysis": result.output},
+        )
+
+        # Determine if tests pass
+        if hasattr(result.output, 'all_passed') and result.output.all_passed:
+            logger.info("All tests passed!")
+            return True
+        else:
+            logger.warning("Tests still failing, will retry")
+            return True  # Continue orchestration, decision tree will handle retries
 
     async def _complete(self) -> dict[str, Any]:
         """Mark job as complete."""
@@ -368,3 +575,84 @@ class StateOrchestrator:
             "error": reason,
             "iterations": self._iteration,
         }
+
+    # ================================================================
+    # Helper Methods
+    # ================================================================
+
+    def _build_planning_context(self, existing_files: list[Any]) -> str:
+        """Build context for planning capability.
+        
+        Includes existing files and their purposes.
+        """
+        if not existing_files:
+            return ""
+        
+        context_lines = ["Existing files in project:"]
+        for file_entry in existing_files:
+            context_lines.append(f"- {file_entry.file_path}: {', '.join(file_entry.exports)}")
+        
+        return "\n".join(context_lines)
+
+    async def _select_next_file_to_generate(self) -> dict[str, Any] | None:
+        """Select next file to generate from the plan.
+        
+        Returns the first file that hasn't been generated yet.
+        """
+        state = await self._memory.get_project_state(self._job_id)
+        if not state:
+            return None
+        
+        planned_files = state.metadata.get("planned_files", [])
+        generated_files = state.metadata.get("generated_files", []) or []
+        
+        for file_plan in planned_files:
+            if file_plan.get("path") not in [g.get("path") if isinstance(g, dict) else g for g in generated_files]:
+                return file_plan
+        
+        return None
+
+    def _validate_code_output(self, output: Any) -> bool:
+        """Validate that code output is valid.
+        
+        Checks:
+        - Not empty
+        - Not just a filename
+        - Contains actual source code
+        - Has parseable syntax
+        """
+        if not output:
+            return False
+        
+        # If it's an object with source_code attribute
+        if hasattr(output, 'source_code'):
+            code = output.source_code
+        elif isinstance(output, dict) and 'source_code' in output:
+            code = output['source_code']
+        elif isinstance(output, str):
+            code = output
+        else:
+            return False
+        
+        if not code or len(code.strip()) < 10:
+            return False
+        
+        # Basic check: should contain more than just a file path
+        if code.count('\n') < 2:
+            return False
+        
+        return True
+
+    def _extract_source_code(self, output: Any) -> str | None:
+        """Extract source code from capability output.
+        
+        Returns the actual source code string.
+        """
+        if hasattr(output, 'source_code'):
+            return output.source_code
+        elif isinstance(output, dict) and 'source_code' in output:
+            return output['source_code']
+        elif isinstance(output, str):
+            return output
+        
+        return None

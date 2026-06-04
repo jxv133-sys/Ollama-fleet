@@ -634,3 +634,116 @@ class AgentExecutor:
         if agent_type == AgentType.SYNTHESIZER:
             return self.settings.ollama.summarizer_model or self.settings.ollama.coder_model
         return self.settings.ollama.coder_model
+
+    # ================================================================
+    # Convenience Methods for Capabilities
+    # ================================================================
+
+    async def execute_planner(self, goal: str, context: str = "") -> Any:
+        """Execute planner capability.
+        
+        Args:
+            goal: Project goal
+            context: Optional project context
+            
+        Returns:
+            PlannerOutput with tasks
+        """
+        task = {
+            "task_id": "planning",
+            "goal": goal,
+        }
+        extra_context = {
+            "context": context,
+            "goal": goal,
+        }
+        output, prompt, raw = await self.execute(task, AgentType.PLANNER, extra_context)
+        return output
+
+    async def execute_coder(
+        self,
+        file_path: str,
+        file_purpose: str,
+        dependencies: list[dict[str, Any]] = None,
+        project_memory: list[dict[str, Any]] = None,
+        requirements: str = "",
+    ) -> Any:
+        """Execute code generation capability.
+        
+        Args:
+            file_path: Target file path
+            file_purpose: Purpose of the file
+            dependencies: Context from dependent files
+            project_memory: Project structure info
+            requirements: Explicit requirements
+            
+        Returns:
+            CoderOutput with source code
+        """
+        task = {
+            "task_id": f"code_{file_path}",
+            "description": f"Generate {file_path}: {file_purpose}",
+        }
+        extra_context = {
+            "file_path": file_path,
+            "purpose": file_purpose,
+            "goal": requirements,
+            "active_files": dependencies or [],
+        }
+        output, prompt, raw = await self.execute(task, AgentType.CODER, extra_context)
+        return output
+
+    async def execute_critic(
+        self,
+        source_code: str,
+        requirements: str = "",
+        test_failures: str = "",
+        file_path: str = "",
+    ) -> Any:
+        """Execute code review capability.
+        
+        Args:
+            source_code: Code to review
+            requirements: Explicit requirements
+            test_failures: Test failure output
+            file_path: File being reviewed
+            
+        Returns:
+            CriticOutput with review results
+        """
+        task = {
+            "task_id": f"review_{file_path}",
+            "description": f"Review {file_path}",
+        }
+        extra_context = {
+            "file_contents": {file_path: source_code},
+            "modified_files": [file_path],
+        }
+        output, prompt, raw = await self.execute(task, AgentType.CRITIC, extra_context)
+        return output
+
+    async def execute_tester(
+        self,
+        test_output: str = "",
+        goal: str = "",
+    ) -> Any:
+        """Execute testing analysis capability.
+        
+        Args:
+            test_output: Test execution output
+            goal: Project goal for context
+            
+        Returns:
+            TesterOutput with analysis
+        """
+        task = {
+            "task_id": "test_analysis",
+            "description": "Analyze test results",
+        }
+        extra_context = {
+            "test_results": test_output,
+            "goal": goal,
+        }
+        output, prompt, raw = await self.execute(task, AgentType.TESTER, extra_context)
+        return output
+

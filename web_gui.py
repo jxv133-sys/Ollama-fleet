@@ -326,6 +326,71 @@ def create_app(state: AppState) -> FastAPI:
         return config
 
     # -----------------------------------------------------------------------
+    # REST — orchestrator state (state-driven architecture debugging)
+    # -----------------------------------------------------------------------
+    @app.get("/api/orchestrator/state/{job_id}")
+    async def get_orchestrator_state(job_id: str) -> dict[str, Any]:
+        """Returns orchestrator state for debugging: current action, memory, context."""
+        try:
+            with sqlite3.connect(state.db_path, timeout=2.0) as conn:
+                # Get job details
+                job = conn.execute(
+                    "SELECT goal, state, created_at FROM jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if not job:
+                    return {"error": "Job not found"}
+                
+                # Get project memory (if available)
+                memory = conn.execute(
+                    "SELECT files, dependencies FROM project_memory WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                
+                return {
+                    "job_id": job_id,
+                    "goal": job[0],
+                    "state": job[1],
+                    "created_at": job[2],
+                    "project_memory": {
+                        "files": json.loads(memory[0]) if memory and memory[0] else {},
+                        "dependencies": json.loads(memory[1]) if memory and memory[1] else {},
+                    } if memory else {},
+                }
+        except sqlite3.Error as e:
+            logger.error(f"❌ DB error getting orchestrator state for {job_id[:8]}: {e}")
+            return {"error": str(e)}
+
+    @app.get("/api/orchestrator/debug/{job_id}")
+    async def get_orchestrator_debug(job_id: str) -> dict[str, Any]:
+        """Returns debug info: current action, validation failures, context used."""
+        try:
+            with sqlite3.connect(state.db_path, timeout=2.0) as conn:
+                # Get recent validation failures
+                failures = conn.execute(
+                    "SELECT file_path, error_msg, timestamp FROM validation_failures WHERE job_id = ? ORDER BY timestamp DESC LIMIT 10",
+                    (job_id,),
+                ).fetchall()
+                
+                # Get generated files with their types
+                files = conn.execute(
+                    "SELECT file_path, file_type, size FROM generated_files WHERE job_id = ? ORDER BY timestamp DESC LIMIT 20",
+                    (job_id,),
+                ).fetchall()
+                
+                return {
+                    "validation_failures": [
+                        {"path": f[0], "error": f[1], "timestamp": f[2]} for f in failures
+                    ] if failures else [],
+                    "generated_files": [
+                        {"path": f[0], "type": f[1], "size": f[2]} for f in files
+                    ] if files else [],
+                }
+        except sqlite3.Error as e:
+            logger.error(f"❌ DB error getting orchestrator debug for {job_id[:8]}: {e}")
+            return {"error": str(e)}
+
+    # -----------------------------------------------------------------------
     # REST — file browser: list workspace files for a job
     # -----------------------------------------------------------------------
     @app.get("/api/jobs/{job_id}/files")
@@ -639,6 +704,11 @@ _HTML += r"""
     </div>
     <div id="jobs-list"></div>
 
+    <div class="panel-title" style="margin-top:4px">🧠 Orchestrator State</div>
+    <div id="orchestrator-state" style="padding:8px;font-size:11px;color:var(--text);font-family:monospace;background:#0f1519;border-bottom:1px solid var(--border);min-height:60px;overflow-y:auto;">
+      <div style="color:var(--muted);font-size:10px;">Loading orchestrator state...</div>
+    </div>
+
     <div class="panel-title" style="margin-top:4px">File Browser</div>
     <div id="file-browser" style="overflow-y:auto;flex:1;min-height:80px">
       <div id="file-list" style="padding:4px 0"></div>
@@ -659,11 +729,17 @@ _HTML += r"""
     </div>
     <div id="ai-summary-panel" style="border-top:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;background:#0f1519;flex:1;">
       <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);flex-shrink:0;">
-        <div class="panel-title" style="margin:0;padding:0;">Agent Output</div>
+        <div style="display:flex;gap:8px;flex-shrink:0;">
+          <button id="tab-agent-output" onclick="switchTab('agent-output')" style="background:none;border:none;color:var(--accent);font-size:11px;padding:0;cursor:pointer;border-bottom:2px solid var(--accent);font-weight:600;">Agent Output</button>
+          <button id="tab-debug-output" onclick="switchTab('debug-output')" style="background:none;border:none;color:var(--muted);font-size:11px;padding:0;cursor:pointer;border-bottom:2px solid transparent;font-weight:600;">🐛 Debug</button>
+        </div>
         <div id="ai-summary-meta" style="color:var(--muted);font-size:11px">📊 Iterations: 0 | 🧪 Tests: pending</div>
       </div>
       <div id="ai-summary-content" style="flex:1;overflow-y:auto;padding:12px;font-family:SF Mono,monospace;font-size:11px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;color:var(--text)">
         <div data-placeholder style="color:var(--muted);text-align:center;padding:20px">Waiting for agents to start working...</div>
+      </div>
+      <div id="debug-output-panel" style="display:none;flex:1;overflow-y:auto;padding:12px;font-family:SF Mono,monospace;font-size:10px;line-height:1.4;white-space:pre-wrap;word-wrap:break-word;color:var(--text);border-top:1px solid var(--border);">
+        <div style="color:var(--muted);text-align:center;padding:20px">Debug output will appear here...</div>
       </div>
     </div>
     <div id="log"></div>
@@ -701,7 +777,119 @@ const state = {
   liveResponse: null,
   iterations: 0,
   testStatus: 'pending',
+  debugLogs: [],   // [{timestamp, level, message}, ...]
+  currentTab: 'agent-output', // 'agent-output' or 'debug-output'
 };
+
+// ── Tab switching ──────────────────────────────────────────────────────────
+function switchTab(tabName) {
+  state.currentTab = tabName;
+  const agentContent = document.getElementById('ai-summary-content');
+  const debugContent = document.getElementById('debug-output-panel');
+  const tabAgent = document.getElementById('tab-agent-output');
+  const tabDebug = document.getElementById('tab-debug-output');
+  
+  if (tabName === 'agent-output') {
+    agentContent.style.display = 'block';
+    debugContent.style.display = 'none';
+    tabAgent.style.color = 'var(--accent)';
+    tabAgent.style.borderBottomColor = 'var(--accent)';
+    tabDebug.style.color = 'var(--muted)';
+    tabDebug.style.borderBottomColor = 'transparent';
+  } else {
+    agentContent.style.display = 'none';
+    debugContent.style.display = 'block';
+    tabAgent.style.color = 'var(--muted)';
+    tabAgent.style.borderBottomColor = 'transparent';
+    tabDebug.style.color = 'var(--accent)';
+    tabDebug.style.borderBottomColor = 'var(--accent)';
+  }
+}
+
+// ── Debug output helpers ───────────────────────────────────────────────────
+function appendDebugLog(message, level = 'info') {
+  const ts = new Date().toLocaleTimeString();
+  state.debugLogs.push({ timestamp: ts, level, message });
+  
+  const debugPanel = document.getElementById('debug-output-panel');
+  if (!debugPanel) return;
+  
+  const isScrolledToBottom = debugPanel.scrollHeight - debugPanel.scrollTop - debugPanel.clientHeight < 60;
+  
+  // Remove placeholder if present
+  const placeholder = debugPanel.querySelector('[data-placeholder]');
+  if (placeholder) placeholder.remove();
+  
+  const logEntry = document.createElement('div');
+  const levelColor = {
+    'error': '#f85149',
+    'warning': '#d29922',
+    'success': '#3fb950',
+    'debug': '#8b949e',
+    'info': '#58a6ff',
+  }[level] || '#8b949e';
+  
+  logEntry.style.cssText = `color:${levelColor};margin-bottom:4px;`;
+  logEntry.textContent = `[${ts}] [${level.toUpperCase()}] ${message}`;
+  
+  debugPanel.appendChild(logEntry);
+  
+  if (isScrolledToBottom) debugPanel.scrollTop = debugPanel.scrollHeight;
+}
+
+// ── Orchestrator state loader ──────────────────────────────────────────────
+async function loadOrchestratorState(jobId) {
+  if (!jobId) return;
+  try {
+    const resp = await fetch(`/api/orchestrator/state/${jobId}`);
+    const data = await resp.json();
+    
+    const statePanel = document.getElementById('orchestrator-state');
+    if (!statePanel) return;
+    
+    let html = '';
+    html += `Goal: ${escHtml(data.goal?.substring(0, 60) || 'N/A')}...\n`;
+    html += `State: <span style="color:#3fb950;font-weight:bold;">${data.state}</span>\n`;
+    html += `Created: ${data.created_at?.substring(0, 16) || 'N/A'}\n`;
+    
+    if (data.project_memory?.files && Object.keys(data.project_memory.files).length > 0) {
+      html += `\nMemory Files: ${Object.keys(data.project_memory.files).length}\n`;
+      for (const [path, info] of Object.entries(data.project_memory.files).slice(0, 3)) {
+        html += `  • ${path}\n`;
+      }
+    }
+    
+    statePanel.innerHTML = `<pre>${escHtml(html)}</pre>`;
+  } catch (err) {
+    appendDebugLog(`Failed to load orchestrator state: ${err}`, 'error');
+  }
+}
+
+// ── Orchestrator debug loader ──────────────────────────────────────────────
+async function loadOrchestratorDebug(jobId) {
+  if (!jobId) return;
+  try {
+    const resp = await fetch(`/api/orchestrator/debug/${jobId}`);
+    const data = await resp.json();
+    
+    if (data.validation_failures && data.validation_failures.length > 0) {
+      appendDebugLog(`🔴 ${data.validation_failures.length} validation failures detected`, 'warning');
+      for (const failure of data.validation_failures.slice(0, 3)) {
+        appendDebugLog(`  Fail: ${failure.path} - ${failure.error?.substring(0, 80)}`, 'error');
+      }
+    }
+    
+    if (data.generated_files && data.generated_files.length > 0) {
+      appendDebugLog(`✅ ${data.generated_files.length} files generated`, 'success');
+      for (const file of data.generated_files.slice(0, 3)) {
+        appendDebugLog(`  Gen: ${file.path} (${file.type}, ${file.size} bytes)`, 'info');
+      }
+    }
+  } catch (err) {
+    appendDebugLog(`Failed to load orchestrator debug: ${err}`, 'error');
+  }
+}
+
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 let ws;
@@ -726,6 +914,7 @@ function handleEvent(ev) {
   else if (t === "task_state_changed") onTaskStateChanged(ev);
   else if (t === "file_written") {
     appendLog(`File created: ${ev.path}`, "success");
+    appendDebugLog(`📄 File written: ${ev.path} (${ev.size || '?'} bytes)`, 'success');
     appendChat("System", `📄 File written: ${ev.path}`, "system");
     addFileChange(ev.path);
     if (state.selectedJobId) refreshFileBrowser(state.selectedJobId);
@@ -733,6 +922,7 @@ function handleEvent(ev) {
   else if (t === "validation_result") onValidation(ev);
   else if (t === "escalation_added") {
     appendLog(`⚠ ESCALATION: ${ev.escalation?.reason}`, "warning");
+    appendDebugLog(`⚠ ESCALATION: ${ev.escalation?.reason || "unknown"}`, 'warning');
     appendChat("System", `⚠ Escalation: ${ev.escalation?.reason || "unknown"}`, "error");
   }
 }
@@ -748,11 +938,14 @@ function onJobStateChanged(ev) {
     updateSummaryPanel();
   }
   appendLog(`Job ${s.toUpperCase()}`, "info");
+  appendDebugLog(`Job state: ${s.toUpperCase()}`, s === "failed" ? "error" : "info");
   appendChat("System", `Job ${s}`, s === "failed" ? "error" : "system");
   refreshJobs();
   // Auto-select the active job so the file browser tracks it
   if (ev.job_id) {
     state.selectedJobId = ev.job_id;
+    loadOrchestratorState(ev.job_id);
+    loadOrchestratorDebug(ev.job_id);
     if (["completed","failed"].includes(s)) refreshFileBrowser(ev.job_id);
   }
 }
@@ -761,6 +954,7 @@ function onAgentLog(ev) {
   const msg = ev.message || "";
   const level = ev.level || "debug";
   appendLog(msg, level);
+  appendDebugLog(msg, level);
   const ml = msg.toLowerCase();
   if (ml.includes("planner") && ml.includes("created")) {
     setAgent("planner", "completed");
@@ -773,6 +967,7 @@ function onAgentOutput(ev) {
   const out = ev.output || {};
   const text = typeof out === "object" ? JSON.stringify(out) : String(out);
   appendLog(`[${agent.toUpperCase()}] ${text}`, agent);
+  appendDebugLog(`[${agent.toUpperCase()}] Output received (${text.length} bytes)`, 'info');
 
   const response = formatAgentMsg(out);
 
@@ -1466,6 +1661,7 @@ async function startJob() {
   state.fileChanges = [];
   state.interactions = [];
   state.iterations = 0;
+  state.debugLogs = []; // Reset debug logs
   renderTasks();
   // Add a separator in chat for new job rather than clearing the whole timeline
   const content = document.getElementById('ai-summary-content');
@@ -1479,10 +1675,17 @@ async function startJob() {
     content.appendChild(sep);
     content.scrollTop = content.scrollHeight;
   }
+  // Clear debug panel
+  const debugPanel = document.getElementById('debug-output-panel');
+  if (debugPanel) {
+    debugPanel.innerHTML = '';
+  }
   updateSummaryPanel();
   showLoading(true);
   setStatusDot("submitted");
   setFooter("Submitting…", "");
+  appendDebugLog(`Job submitted with goal: ${goal.slice(0, 80)}...`, 'info');
+  appendDebugLog(`Models: Planner=${models.planner}, Coder=${models.coder}, Critic=${models.critic}`, 'info');
   const res = await fetch("/api/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1490,7 +1693,10 @@ async function startJob() {
   }).then(r => r.json()).catch(e => ({ error: String(e) }));
   if (res.error) {
     appendLog(`Submit error: ${res.error}`, "error");
+    appendDebugLog(`Job submission failed: ${res.error}`, 'error');
     setJobRunning(false);
+  } else {
+    appendDebugLog(`Job created successfully`, 'success');
   }
 }
 
